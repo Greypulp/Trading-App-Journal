@@ -1,0 +1,464 @@
+ # dashboard.py (Streamlit) - includes risk management metrics and live limits
+import os, time, json
+from datetime import datetime, timezone
+import streamlit as st
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+st.set_page_config(page_title="MT5 Dashboard", layout="wide")
+
+# --- Timeframe Map (must be above sidebar controls) ---
+TIMEFRAME_MAP = {'M15': mt5.TIMEFRAME_M15, 'H1': mt5.TIMEFRAME_H1}
+
+# --- Sidebar Controls ---
+with st.sidebar:
+    st.title("Controls & Risk Settings")
+    selected_tab = st.radio("Select View", ["Dashboard", "Trading Journal"], key="main_tab")
+    symbol = st.selectbox("Symbol", ["XAUUSD"], index=0, key="symbol_select")
+    timeframe = st.selectbox("Timeframe", list(TIMEFRAME_MAP.keys()), index=0, key="tf_select")
+    bars = st.slider("Bars to Load", min_value=500, max_value=3000, value=2000, step=100, key="bars_slider")
+    st.markdown("---")
+    st.subheader("Risk Controls")
+    max_daily_dd = st.number_input("Max Daily Drawdown (%)", min_value=1.0, max_value=20.0, value=5.0, step=0.1, key="max_dd_input")
+    max_risk_trade = st.number_input("Max Risk per Trade (%)", min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="max_risk_input")
+    max_total_exposure = st.number_input("Max Total Exposure (lots)", min_value=0.1, max_value=20.0, value=5.0, step=0.1, key="max_exposure_input")
+    st.markdown("---")
+    st.subheader("Pivot Detection Settings")
+    L = st.slider("Pivot Left Bars (L)", min_value=5, max_value=30, value=15, step=1, key="pivot_L")
+    R = st.slider("Pivot Right Bars (R)", min_value=5, max_value=30, value=10, step=1, key="pivot_R")
+
+DEFAULT_SYMBOL = "XAUUSD"
+TIMEFRAME_MAP = {'M15': mt5.TIMEFRAME_M15, 'H1': mt5.TIMEFRAME_H1}
+BOX_WID = 0.7
+
+def init_mt5():
+    return mt5.initialize()
+
+mt5_ok = init_mt5()
+
+def fetch_rates(symbol, timeframe, n_bars):
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n_bars)
+    if rates is None:
+        return pd.DataFrame()
+    df = pd.DataFrame(rates); df['time']=pd.to_datetime(df['time'], unit='s'); df.set_index('time', inplace=True)
+    return df
+
+def find_pivots(df, L, R):
+    h = df['high'].values; l = df['low'].values; n = len(df)
+    piv_hi = np.zeros(n, dtype=bool); piv_lo = np.zeros(n, dtype=bool)
+    for i in range(L, n-R):
+        window_h = h[i-L:i+R+1]; window_l = l[i-L:i+R+1]
+        if np.nanmax(window_h)==h[i] and (window_h==h[i]).sum()==1: piv_hi[i]=True
+        if np.nanmin(window_l)==l[i] and (window_l==l[i]).sum()==1: piv_lo[i]=True
+    return pd.Series(piv_hi, index=df.index), pd.Series(piv_lo, index=df.index)
+
+def get_account_info():
+    acc = mt5.account_info()
+    if acc: return {'Balance': acc.balance, 'Equity': acc.equity, 'Margin': acc.margin, 'Free': acc.margin_free}
+    return None
+
+def get_open_positions_df(symbol):
+    pos = mt5.positions_get(symbol=symbol); 
+    if not pos: return pd.DataFrame()
+    rows=[] 
+    for p in pos: rows.append([p.ticket, p.symbol, p.volume, p.price_open, p.sl, p.tp, p.profit, datetime.fromtimestamp(p.time, timezone.utc)])
+    return pd.DataFrame(rows, columns=['Ticket','Symbol','Volume','Open','SL','TP','Profit','Time'])
+
+def get_recent_trades_df(days=30):
+
+    now = time.time()
+    frm = now - days * 86400
+    deals = mt5.history_deals_get(frm, now)
+    if not deals:
+        return pd.DataFrame()
+    rows = []
+    for d in deals:
+        rows.append([d.ticket, d.symbol, d.volume, d.price, d.profit, datetime.fromtimestamp(d.time, timezone.utc)])
+    return pd.DataFrame(rows, columns=['Ticket','Symbol','Volume','Price','Profit','Time'])
+
+
+    # ...existing code...
+
+with st.sidebar.expander('Chart Display Options', expanded=True):
+    st.write('Showing only today\'s data.')
+    st.caption('Adjust symbol, timeframe, and bars above.')
+
+with st.sidebar.expander('Risk Controls', expanded=False):
+    st.write(f"Max daily drawdown: {max_daily_dd}%")
+    st.write(f"Max risk per trade: {max_risk_trade}% (example lot: {max_risk_trade})")
+    st.write(f"Max total exposure (lots): {max_total_exposure}")
+
+# --- Account Details in Sidebar ---
+acc = get_account_info()
+if acc:
+    st.sidebar.markdown('---')
+    st.sidebar.subheader('💼 MT5 Account Details')
+    st.sidebar.write(f"**Balance:** ${acc['Balance']:.2f}")
+    st.sidebar.write(f"**Equity:** ${acc['Equity']:.2f}")
+    st.sidebar.write(f"**Margin:** ${acc['Margin']:.2f}")
+    st.sidebar.write(f"**Free Margin:** ${acc['Free']:.2f}")
+else:
+    st.sidebar.warning('No account info available.')
+
+tf = TIMEFRAME_MAP[timeframe]
+
+df = fetch_rates(symbol, tf, bars)
+if df.empty:
+    st.error('No data from MT5'); st.stop()
+
+# Ensure df.index is timezone-aware UTC for safe comparison
+if df.index.tz is None:
+    df.index = df.index.tz_localize('UTC')
+
+# Filter df to only today's data using UTC+3:00 as the trading day start
+import pytz
+tz_moscow = timezone.utc if not hasattr(pytz, 'timezone') else pytz.timezone('Etc/GMT-3')
+now_utc = datetime.now(timezone.utc)
+now = now_utc.astimezone(tz_moscow)
+today_start = now.replace(hour=3, minute=0, second=0, microsecond=0)
+if now.hour < 3:
+    today_start = today_start - pd.Timedelta(days=1)
+today_start_utc = today_start.astimezone(timezone.utc)
+next_day_start_utc = (today_start + pd.Timedelta(days=1)).astimezone(timezone.utc)
+df_today = df[(df.index >= today_start_utc) & (df.index < next_day_start_utc)]
+if df_today.empty:
+    # Find the most recent previous day with data (using UTC+3 day boundaries)
+    prev_day = today_start - pd.Timedelta(days=1)
+    while prev_day > df.index.min():
+        prev_start_utc = prev_day.astimezone(timezone.utc)
+        prev_end_utc = (prev_day + pd.Timedelta(days=1)).astimezone(timezone.utc)
+        day_df = df[(df.index >= prev_start_utc) & (df.index < prev_end_utc)]
+        if not day_df.empty:
+            df_today = day_df
+            st.warning(f"No data for today. Showing data for {prev_day.strftime('%Y-%m-%d')} (UTC+3) instead.")
+            break
+        prev_day -= pd.Timedelta(days=1)
+    else:
+        st.error('No data for today or any previous day from MT5'); st.stop()
+df = df_today
+
+
+# --- Data Preparation ---
+piv_hi, piv_lo = find_pivots(df, L, R)
+
+positions_df = get_open_positions_df(symbol)
+trades_df = get_recent_trades_df(days=30)
+balance = acc['Balance'] if acc else 0.0
+
+now = datetime.now(timezone.utc)
+start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+deals_today = mt5.history_deals_get(start.timestamp(), time.time()) or []
+realized_today = sum(getattr(d,'profit',0.0) for d in deals_today)
+realized_pct = (realized_today / balance * 100.0) if balance else 0.0
+
+closed = trades_df[trades_df['Symbol']==symbol] if not trades_df.empty else pd.DataFrame()
+lastN = 50; sample = closed.tail(lastN)
+wins = sample[sample['Profit']>0]['Profit'].sum() if not sample.empty else 0.0
+losses = -sample[sample['Profit']<0]['Profit'].sum() if not sample.empty else 0.0
+win_rate = (sample['Profit']>0).mean()*100 if not sample.empty else 0.0
+profit_factor = (wins / losses) if losses>0 else float('inf') if wins>0 else 0.0
+
+# --- Weekly P&L and Account Growth ---
+week_ago = now - pd.Timedelta(days=7)
+deals_week = [d for d in mt5.history_deals_get(week_ago.timestamp(), time.time()) or []]
+weekly_pnl = sum(getattr(d, 'profit', 0.0) for d in deals_week)
+
+# Estimate balance 7 days ago (current balance - closed P&L since then)
+balance_7d_ago = balance - weekly_pnl
+account_growth = ((balance - balance_7d_ago) / balance_7d_ago * 100.0) if balance_7d_ago else 0.0
+
+try:
+    eq = (sample['Profit'].cumsum() + balance).ffill().values if not sample.empty else np.array([balance])
+    peak = np.maximum.accumulate(eq); dd = ((peak - eq).max() / peak.max())*100 if len(eq)>0 and peak.max()>0 else 0.0
+except Exception:
+    dd = 0.0
+
+exposure_lots = positions_df['Volume'].sum() if not positions_df.empty else 0.0
+
+
+# --- Example lot size calculation for current risk setting ---
+info = mt5.symbol_info(symbol); digits = info.digits if info else 5
+pip = 0.0001 if digits>=4 else 0.01
+default_sl = 50
+def example_lot_for_risk(balance, stop_pips, risk_pct):
+    try:
+        contract = info.trade_contract_size if info and hasattr(info,'trade_contract_size') else 100000
+        pip_val = contract * (0.0001 if digits>=4 else 0.01)
+        risk_amount = balance * (risk_pct/100.0)
+        lot = risk_amount / (stop_pips * pip_val)
+        return max(0.01, round(lot,2)), risk_amount, pip_val
+    except Exception:
+        return 0.01, 0.0, 0.0
+
+example_lot, example_risk_usd, example_pip_val = example_lot_for_risk(balance, default_sl, max_risk_trade)
+
+# --- Display autocalculated lot size and formula in sidebar ---
+with st.sidebar.expander('🧮 Lot Size Calculation', expanded=False):
+    st.write(f"**Autocalculated lot size:** <span style='color:#2563eb;font-size:1.2em'>{example_lot:.2f}</span>", unsafe_allow_html=True)
+    st.write(f"**Risk in $:** <span style='color:#eab308;font-size:1.1em'>${example_risk_usd:,.2f}</span> (for {max_risk_trade:.2f}% of balance)", unsafe_allow_html=True)
+    st.caption(f"For risk = {max_risk_trade:.2f}% of balance, SL = {default_sl} pips.")
+    st.markdown('''
+    **Formula:**
+    
+    `lot = (balance * risk% / 100) / (stop_loss_pips * pip_value_per_lot)`
+    
+    Where:
+    - `balance` = account balance
+    - `risk%` = max risk per trade (from above)
+    - `stop_loss_pips` = default 50
+    - `pip_value_per_lot` = contract size × pip size
+    ''')
+
+
+
+# --- Page Routing ---
+if selected_tab == "Dashboard":
+    # --- Streamlit-native Summary Section ---
+    with st.container():
+        summary_cols = st.columns(5)
+        summary_cols[0].metric('💰 Balance', f"${balance:,.2f}")    
+        summary_cols[1].metric('💵 Realized P&L Today', f"${realized_today:,.2f}", delta=f"{realized_pct:.2f}%", delta_color="normal" if realized_today>=0 else "inverse")
+        summary_cols[2].metric('📆 Weekly P&L', f"${weekly_pnl:,.2f}")
+        summary_cols[3].metric('✅ Win Rate', f"{win_rate:.1f}%")
+        summary_cols[4].metric('📈 Account Growth (7d)', f"{account_growth:.2f}%")        
+        extra_cols = st.columns(4)
+        extra_cols[0].metric('🧮 Example Lot', f"{example_lot:.2f}")
+        extra_cols[1].metric('📊 Exposure (lots)', f"{exposure_lots:.2f}")
+        extra_cols[2].metric('🛡️ Drawdown %', f"{dd:.2f}%")
+        extra_cols[3].metric('📊 Profit Factor', f"{profit_factor:.2f}")
+        st.markdown('<hr style="margin-top:8px;margin-bottom:8px;border:0;border-top:1px solid #e0e7ef;">', unsafe_allow_html=True)
+        col1, col2 = st.columns([2,1], gap="small")
+        with col1:
+            st.header('📈 Today\'s Price Chart')
+            st.caption('Live price chart with pivots and risk overlays. Data auto-refreshes.')
+            fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
+            hi_idx = np.where(piv_hi.values)[0]; lo_idx = np.where(piv_lo.values)[0]
+            if len(hi_idx):
+                fig.add_trace(go.Scatter(x=df.index[hi_idx], y=df['high'].iloc[hi_idx], mode='markers', marker=dict(color='red', size=8), name='Pivot Highs'))
+            if len(lo_idx):
+                fig.add_trace(go.Scatter(x=df.index[lo_idx], y=df['low'].iloc[lo_idx], mode='markers', marker=dict(color='green', size=8), name='Pivot Lows'))
+            for idx in hi_idx:
+                price = df['high'].iat[idx]; top,bottom = price*(1+0.001*BOX_WID), price; t0=df.index[idx]; t1=df.index[-1]
+                fig.add_shape(type='rect', x0=t0, x1=t1, y0=bottom, y1=top, fillcolor='rgba(200,50,50,0.12)', line_width=0)
+            for idx in lo_idx:
+                price = df['low'].iat[idx]; top,bottom = price, price*(1-0.001*BOX_WID); t0=df.index[idx]; t1=df.index[-1]
+                fig.add_shape(type='rect', x0=t0, x1=t1, y0=bottom, y1=top, fillcolor='rgba(50,180,80,0.12)', line_width=0)
+            fig.update_layout(
+                xaxis_rangeslider_visible=True,
+                xaxis_title='Time',
+                yaxis_title='Price',
+                margin=dict(l=10, r=10, t=30, b=10),
+                plot_bgcolor='#f8fafc',
+                paper_bgcolor='#f8fafc',
+                font=dict(size=13)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            st.subheader('📂 Open Positions')
+            if not positions_df.empty:
+                df_pos = positions_df.copy()
+                if 'Time' in df_pos.columns:
+                    df_pos['Time'] = df_pos['Time'].dt.strftime('%Y-%m-%d %H:%M')
+                st.dataframe(
+                    df_pos,
+                    width='stretch',
+                    hide_index=True,
+                    column_config={
+                        'Time': st.column_config.Column('Time', width='medium', help='Open time (UTC)'),
+                        'Profit': st.column_config.Column('Profit', width='small', help='Unrealized profit in $'),
+                        'Volume': st.column_config.Column('Volume', width='small', help='Position size (lots)'),
+                    }
+                )
+            else:
+                st.info('No open positions')
+
+    # --- Footer ---
+    st.markdown('---')
+    st.markdown('<div style="text-align:center; color:#888; font-size:0.95em;">MT5 Dashboard &copy; 2025 &mdash; Powered by Streamlit | For support, contact your developer.</div>', unsafe_allow_html=True)
+
+    if st.button('Shutdown MT5', help='Disconnect and close MT5 terminal'):
+        mt5.shutdown(); st.rerun()
+
+
+elif selected_tab == "Trading Journal":
+    notes_path = os.path.join(os.path.dirname(__file__), 'journal_notes.json')
+    if 'journal_notes' not in st.session_state:
+        if os.path.exists(notes_path):
+            try:
+                with open(notes_path, 'r') as f:
+                    st.session_state['journal_notes'] = json.load(f)
+            except Exception:
+                st.session_state['journal_notes'] = {}
+        else:
+            st.session_state['journal_notes'] = {}
+
+    # --- Card-style header ---
+    st.markdown('''
+        <div style="background:linear-gradient(90deg,#0f172a 0%,#2563eb 100%);padding:24px 32px 18px 32px;border-radius:18px;margin-bottom:18px;box-shadow:0 2px 12px rgba(0,0,0,0.07);color:#fff;">
+            <div style="font-size:2.1em;font-weight:700;letter-spacing:0.5px;">📓 Trading Journal</div>
+            <div style="font-size:1.1em;font-weight:400;opacity:0.92;">Calendar view of daily P&L from MT5 live data.<br><span style='color:#4ade80;'>Green = profit</span>, <span style='color:#f87171;'>Red = loss</span>.</div>
+        </div>
+    ''', unsafe_allow_html=True)
+    st.markdown('''
+        <style>
+        .journal-calendar-card {
+            background: #f8fafc;
+            border-radius: 18px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+            padding: 24px 18px 18px 18px;
+            margin-bottom: 18px;
+        }
+        .journal-cell {
+            transition: box-shadow 0.2s, border 0.2s;
+            cursor: pointer;
+        }
+        .journal-cell:hover {
+            box-shadow: 0 0 0 2px #2563eb33;
+            border: 1.5px solid #2563eb;
+        }
+        .journal-date {
+            font-size: 1.1em;
+            font-weight: 600;
+            margin-bottom: 2px;
+        }
+        .notes-section {
+            background: #f1f5f9;
+            border-radius: 12px;
+            padding: 18px 18px 10px 18px;
+            margin-bottom: 18px;
+            box-shadow: 0 1px 6px rgba(0,0,0,0.04);
+        }
+        .notes-title {
+            font-size: 1.2em;
+            font-weight: 700;
+            color: #2563eb;
+            margin-bottom: 8px;
+        }
+        </style>
+    ''', unsafe_allow_html=True)
+
+    # --- Month and Year selectors ---
+    import calendar
+    from datetime import date, timedelta
+    import json
+    today = date.today()
+    min_year = 2020
+    max_year = today.year
+    years = list(range(min_year, max_year+1))
+    months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+    col_month, col_year = st.columns([2,1])
+    selected_month = col_month.selectbox('Month', options=months, index=today.month-1, key='journal_month_select')
+    selected_year = col_year.selectbox('Year', options=years[::-1], index=0, key='journal_year_select')
+    month_idx = months.index(selected_month) + 1
+    first_day = date(selected_year, month_idx, 1)
+    start_day = first_day - timedelta(days=first_day.weekday())
+    days = [start_day + timedelta(days=i) for i in range(35)]
+
+    # --- Fetch trades for the selected month and year ---
+    from calendar import monthrange
+    from datetime import datetime, timezone
+    month_days = monthrange(selected_year, month_idx)[1]
+    month_start = datetime(selected_year, month_idx, 1, 0, 0, 0, tzinfo=timezone.utc)
+    month_end = datetime(selected_year, month_idx, month_days, 23, 59, 59, tzinfo=timezone.utc)
+    deals = mt5.history_deals_get(month_start.timestamp(), month_end.timestamp())
+    if deals:
+        trades = pd.DataFrame([
+            [d.ticket, d.symbol, d.volume, d.price, d.profit, datetime.fromtimestamp(d.time, timezone.utc)]
+            for d in deals
+        ], columns=['Ticket','Symbol','Volume','Price','Profit','Time'])
+    else:
+        trades = pd.DataFrame(columns=['Ticket','Symbol','Volume','Price','Profit','Time'])
+    if not trades.empty:
+        trades['Date'] = trades['Time'].dt.date
+        daily_pnl = trades.groupby('Date')['Profit'].sum().reset_index()
+        daily_pnl['Type'] = np.where(daily_pnl['Profit']>=0, 'Profit', 'Loss')
+    else:
+        daily_pnl = pd.DataFrame(columns=['Date','Profit','Type'])
+
+    # Build a dict for fast lookup
+    pnl_map = {row['Date']: row for _, row in daily_pnl.iterrows()}
+
+    # Build a dict for fast lookup
+    pnl_map = {row['Date']: row for _, row in daily_pnl.iterrows()}
+
+    # --- Calendar grid with tooltips (static, not interactive) ---
+    st.markdown('<div class="journal-calendar-card">', unsafe_allow_html=True)
+    week_days = ['Mon','Tue','Wed','Thu','Fri']
+    num_days = len(week_days)
+    cols = st.columns(num_days)
+    for i, wd in enumerate(week_days):
+        cols[i].markdown(f"<div style='text-align:center;font-weight:bold;font-size:1.08em;color:#334155'>{wd}</div>", unsafe_allow_html=True)
+    for week in range(5):
+        cols = st.columns(num_days)
+        for day in range(num_days):
+            d = days[week*7+day]
+            if d.weekday() > 4:
+                continue
+            cell = ''
+            date_str = f"<div class='journal-date'>{d.day}</div>"
+            note_str = st.session_state['journal_notes'].get(d.strftime('%Y-%m-%d'), "")
+            def escape_html(text):
+                import html
+                return html.escape(text)
+            tooltip = ""
+            if d.month == month_idx and d.year == selected_year:
+                if d in pnl_map:
+                    row = pnl_map[d]
+                    if row['Type']=='Profit':
+                        tooltip = f"Profit: ${row['Profit']:.2f}"
+                        font_color = '#059669'  # deep green
+                    else:
+                        tooltip = f"Loss: ${-row['Profit']:.2f}"
+                        font_color = '#dc2626'  # deep red
+                    if note_str:
+                        tooltip += f"\nNote: {note_str}"
+                    tooltip_html = escape_html(tooltip).replace('\n', '&#10;')
+                    cell = f"<div style='position:relative'><div class='journal-cell' title='{tooltip_html}' style='background:#f8fafc;color:{font_color};border-radius:8px;padding:4px 0 2px 0;font-weight:700;font-size:1.08em;'>{date_str}{'Profit: $' if row['Type']=='Profit' else 'Loss: $'}{abs(row['Profit']):.2f}</div></div>"
+                else:
+                    tooltip = note_str if note_str else ""
+                    tooltip_html = escape_html(tooltip).replace('\n', '&#10;')
+                    cell = f"<div style='position:relative'><div class='journal-cell empty' title='{tooltip_html}'>{date_str}&nbsp;</div></div>"
+            else:
+                cell = f"<div style='position:relative'><div class='journal-cell empty'>{date_str}&nbsp;</div></div>"
+            cols[day].markdown(cell, unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div style="height:18px;"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
+
+    # --- Day selector for notes ---
+    valid_days = [d.day for d in days if d.month == month_idx and d.year == selected_year]
+    selected_day = st.selectbox('Select Day for Notes', options=valid_days, index=valid_days.index(today.day) if today.month == month_idx and today.year == selected_year else 0, key='journal_day_select')
+
+    # --- Notes section for selected date ---
+    selected_date = date(selected_year, month_idx, selected_day)
+    selected_date_str = selected_date.strftime('%Y-%m-%d')
+    st.markdown(f'<div class="notes-section"><div class="notes-title">📝 Notes for {selected_date_str}</div>', unsafe_allow_html=True)
+    note_key = f"note_{selected_date_str}"
+    current_note = st.session_state['journal_notes'].get(selected_date_str, "")
+    new_note = st.text_area("Add/Edit Note", value=current_note, key=note_key)
+    if st.button("Save Note", key=f"save_{note_key}"):
+        st.session_state['journal_notes'][selected_date_str] = new_note
+        try:
+            with open(notes_path, 'w') as f:
+                json.dump(st.session_state['journal_notes'], f, indent=2)
+            st.success("Note saved for this day.")
+        except Exception as e:
+            st.error(f"Failed to save note: {e}")
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div style="height:18px;"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:1.18em;font-weight:600;color:#334155;margin-bottom:8px;">🕒 Recent Trades</div>', unsafe_allow_html=True)
+    if not trades.empty:
+        # Show trades for the selected date if selected, else for the selected month
+        selected_date_trades = trades[(trades['Time'].dt.date == selected_date)]
+        if not selected_date_trades.empty:
+            trades_sorted = selected_date_trades.sort_values('Time', ascending=False).copy()
+            st.markdown(f'<div style="font-size:1.05em;color:#2563eb;font-weight:500;margin-bottom:4px;">Showing trades for <b>{selected_date.strftime("%Y-%m-%d")}</b></div>', unsafe_allow_html=True)
+        else:
+            trades_month = trades[(trades['Time'].dt.month == month_idx) & (trades['Time'].dt.year == selected_year)]
+            trades_sorted = trades_month.sort_values('Time', ascending=False).copy()
+            st.markdown(f'<div style="font-size:1.05em;color:#2563eb;font-weight:500;margin-bottom:4px;">No trades for selected day. Showing all trades for <b>{selected_month} {selected_year}</b></div>', unsafe_allow_html=True)
+        if 'Time' in trades_sorted.columns:
+            trades_sorted['Time'] = trades_sorted['Time'].dt.strftime('%Y-%m-%d %H:%M')
