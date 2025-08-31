@@ -1,3 +1,68 @@
+# --- Next Market Open Helper ---
+def get_next_market_open():
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()  # Monday=0, Sunday=6
+    hour = now.hour
+    minute = now.minute
+    # Market closed from Fri 21:00 UTC to Sun 22:00 UTC
+    if (weekday == 4 and (hour > 21 or (hour == 21 and minute >= 0))) or (weekday == 5) or (weekday == 6 and (hour < 22)):
+        # Next open is Sunday 22:00 UTC
+        days_ahead = (6 - weekday) % 7
+        next_open = now.replace(hour=22, minute=0, second=0, microsecond=0) + pd.Timedelta(days=days_ahead)
+        if now > next_open:
+            next_open += pd.Timedelta(days=7)
+        return next_open
+    else:
+        # Market is open, next open is after next close
+        # Find next Friday 21:00 UTC
+        days_ahead = (4 - weekday) % 7
+        next_close = now.replace(hour=21, minute=0, second=0, microsecond=0) + pd.Timedelta(days=days_ahead)
+        if now >= next_close:
+            # Already past this week's close, so next week's open
+            next_open = next_close + pd.Timedelta(days=2, hours=1)
+            return next_open
+        else:
+            # Market is open, so no countdown
+            return None
+# --- Trading Session Helper ---
+def get_active_session():
+    # Sessions in UTC
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+    # Asia: 00:00-07:59, London: 08:00-15:59, New York: 16:00-20:59, Closed: 21:00-23:59
+    if 0 <= hour < 8:
+        return 'Asia'
+    elif 8 <= hour < 16:
+        return 'London'
+    elif 16 <= hour < 21:
+        return 'New York'
+    else:
+        return 'Closed'
+# --- Session Status Helper ---
+def get_session_status():
+    bot_status_path = os.path.join(os.path.dirname(__file__), 'bot_status.txt')
+    if os.path.exists(bot_status_path):
+        try:
+            with open(bot_status_path, 'r') as f:
+                status = f.read().strip().lower()
+            if status == 'running':
+                return 'Active'
+            elif status == 'stopped':
+                return 'Inactive'
+        except Exception:
+            pass
+    return 'Unknown'
+# --- Market Status Helper ---
+def get_market_status():
+    # XAUUSD: open Sun 22:00 UTC, close Fri 21:00 UTC (typical for gold/forex)
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()  # Monday=0, Sunday=6
+    hour = now.hour
+    minute = now.minute
+    # Market closed from Fri 21:00 UTC to Sun 22:00 UTC
+    if (weekday == 4 and (hour > 21 or (hour == 21 and minute >= 0))) or (weekday == 5) or (weekday == 6 and (hour < 22)):
+        return 'Closed'
+    return 'Open'
  # dashboard.py (Streamlit) - includes risk management metrics and live limits
 import os, time, json
 from datetime import datetime, timezone
@@ -245,6 +310,68 @@ if all(x in globals() for x in ['timeframe', 'symbol', 'bars']):
 
 # --- Data Preparation ---
 if selected_tab == "Dashboard":
+    # --- Auto-refresh dashboard every 60 seconds ---
+    import streamlit as st
+    import time
+    if 'last_refresh' not in st.session_state:
+        st.session_state['last_refresh'] = time.time()
+    if time.time() - st.session_state['last_refresh'] > 60:
+        st.session_state['last_refresh'] = time.time()
+        st.experimental_rerun()
+    # --- Always show countdown timer to next market open ---
+    def get_next_market_open():
+        now = datetime.now(timezone.utc)
+        weekday = now.weekday()  # Monday=0, Sunday=6
+        hour = now.hour
+        minute = now.minute
+        # Market closed from Fri 21:00 UTC to Sun 22:00 UTC
+        if (weekday == 4 and (hour > 21 or (hour == 21 and minute >= 0))) or (weekday == 5) or (weekday == 6 and (hour < 22)):
+            # Next open is Sunday 22:00 UTC
+            days_ahead = (6 - weekday) % 7
+            next_open = now.replace(hour=22, minute=0, second=0, microsecond=0) + pd.Timedelta(days=days_ahead)
+            if now > next_open:
+                next_open += pd.Timedelta(days=7)
+            return next_open
+        else:
+            # Market is open, next open is after next close
+            # Find next Friday 21:00 UTC
+            days_ahead = (4 - weekday) % 7
+            next_close = now.replace(hour=21, minute=0, second=0, microsecond=0) + pd.Timedelta(days=days_ahead)
+            if now >= next_close:
+                # Already past this week's close, so next week's open
+                next_open = next_close + pd.Timedelta(days=2, hours=1)
+                return next_open
+            else:
+                # Market is open, so next open is after next close
+                next_open = next_close + pd.Timedelta(days=2, hours=1)
+                return next_open
+
+    next_open = get_next_market_open()
+    if next_open:
+        delta = next_open - datetime.now(timezone.utc)
+        hours, remainder = divmod(int(delta.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        st.info(f"⏳ Time to Next Market Open: {hours}h {minutes}m {seconds}s (at {next_open.strftime('%Y-%m-%d %H:%M UTC')})")
+    # ...countdown timer to next market open removed...
+
+    # --- Bell notification when market opens (only once per open event) ---
+    market_status = get_market_status()
+    if 'prev_market_status' not in st.session_state:
+        st.session_state['prev_market_status'] = market_status
+    play_bell = False
+    if st.session_state['prev_market_status'] == 'Closed' and market_status == 'Open':
+        play_bell = True
+    st.session_state['prev_market_status'] = market_status
+    if play_bell:
+        bell_js = """
+        <script>
+        var audio = new Audio('https://cdn.pixabay.com/audio/2022/07/26/audio_124bfae5b6.mp3');
+        audio.volume = 0.7;
+        audio.play();
+        </script>
+        """
+        st.markdown(bell_js, unsafe_allow_html=True)
+
     piv_hi, piv_lo = find_pivots(df, L, R)
 
     positions_df = get_open_positions_df(symbol)
@@ -302,17 +429,17 @@ if selected_tab == "Dashboard":
         st.write(f"**Autocalculated lot size:** <span style='color:#2563eb;font-size:1.2em'>{example_lot:.2f}</span>", unsafe_allow_html=True)
         st.write(f"**Risk in $:** <span style='color:#eab308;font-size:1.1em'>${example_risk_usd:,.2f}</span> (for {max_risk_trade:.2f}% of balance)", unsafe_allow_html=True)
         st.caption(f"For risk = {max_risk_trade:.2f}% of balance, SL = {default_sl} pips.")
-        st.markdown('''
+        st.markdown("""
         **Formula:**
         
         `lot = (balance * risk% / 100) / (stop_loss_pips * pip_value_per_lot)`
         
         Where:
-        - `balance` = account balance
-        - `risk%` = max risk per trade (from above)
-        - `stop_loss_pips` = default 50
-        - `pip_value_per_lot` = contract size × pip size
-        ''')
+        - balance = account balance
+        - risk% = max risk per trade (from above)
+        - stop_loss_pips = default 50
+        - pip_value_per_lot = contract size × pip size
+        """, unsafe_allow_html=True)
 
 
 
@@ -320,12 +447,37 @@ if selected_tab == "Dashboard":
 if selected_tab == "Dashboard":
     # --- Streamlit-native Summary Section ---
     with st.container():
-        summary_cols = st.columns(5)
+        summary_cols = st.columns(7)
         summary_cols[0].metric('💰 Balance', f"${balance:,.2f}")    
         summary_cols[1].metric('💵 Realized P&L Today', f"${realized_today:,.2f}", delta=f"{realized_pct:.2f}%", delta_color="normal" if realized_today>=0 else "inverse")
         summary_cols[2].metric('📆 Weekly P&L', f"${weekly_pnl:,.2f}")
         summary_cols[3].metric('✅ Win Rate', f"{win_rate:.1f}%")
-        summary_cols[4].metric('📈 Account Growth (7d)', f"{account_growth:.2f}%")        
+        summary_cols[4].metric('📈 Account Growth (7d)', f"{account_growth:.2f}%")
+        # Market Status
+        market_status = get_market_status()
+        if market_status == 'Open':
+            summary_cols[5].success('🟢 Market Open')
+        else:
+            summary_cols[5].error('🔴 Market Closed')
+        # Session Status
+        session_status = get_session_status()
+        if session_status == 'Active':
+            summary_cols[6].success('🟢 Session Active')
+        elif session_status == 'Inactive':
+            summary_cols[6].error('🔴 Session Inactive')
+        else:
+            summary_cols[6].warning('⚠️ Session Unknown')
+
+        # Show which session is active
+        active_session = get_active_session()
+        if active_session == 'Asia':
+            st.info('🌏 Asia Session Active (00:00-07:59 UTC)')
+        elif active_session == 'London':
+            st.info('🇬🇧 London Session Active (08:00-15:59 UTC)')
+        elif active_session == 'New York':
+            st.info('🇺🇸 New York Session Active (16:00-20:59 UTC)')
+        else:
+            st.warning('⏸️ No Major Session Active (21:00-23:59 UTC)')
         extra_cols = st.columns(4)
         extra_cols[0].metric('🧮 Example Lot', f"{example_lot:.2f}")
         extra_cols[1].metric('📊 Exposure (lots)', f"{exposure_lots:.2f}")
@@ -398,13 +550,13 @@ elif selected_tab == "Trading Journal":
             st.session_state['journal_notes'] = {}
 
     # --- Card-style header ---
-    st.markdown('''
+    st.markdown("""
         <div style="background:linear-gradient(90deg,#0f172a 0%,#2563eb 100%);padding:24px 32px 18px 32px;border-radius:18px;margin-bottom:18px;box-shadow:0 2px 12px rgba(0,0,0,0.07);color:#fff;">
             <div style="font-size:2.1em;font-weight:700;letter-spacing:0.5px;">📓 Trading Journal</div>
             <div style="font-size:1.1em;font-weight:400;opacity:0.92;">Calendar view of daily P&L from MT5 live data.<br><span style='color:#4ade80;'>Green = profit</span>, <span style='color:#f87171;'>Red = loss</span>.</div>
         </div>
-    ''', unsafe_allow_html=True)
-    st.markdown('''
+    """, unsafe_allow_html=True)
+    st.markdown("""
         <style>
         .journal-calendar-card {
             background: #f8fafc;
@@ -440,7 +592,7 @@ elif selected_tab == "Trading Journal":
             margin-bottom: 8px;
         }
         </style>
-    ''', unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
     # --- Month and Year selectors ---
     import calendar

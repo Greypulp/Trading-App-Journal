@@ -8,7 +8,7 @@ import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 import threading
- # Telegram imports removed
+from telegram import Bot
 import warnings
 import os, json
 
@@ -51,8 +51,11 @@ MAX_RISK_PER_SYMBOL_PCT = 1.0      # 1% max risk per symbol per day
 def get_max_risk_per_trade_pct():
     return STANDARD_RISK_PER_TRADE_PCT
 
+
 # Telegram settings
- # Telegram settings removed
+TELEGRAM_BOT_TOKEN = '8177282153:AAHf7HJlNwUG23JMJa9dvnEstihel68VjPU'
+TELEGRAM_CHAT_ID = '8426349009'
+telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 # Suppress specific warnings globally
 warnings.filterwarnings("ignore", message="python-telegram-bot is using upstream urllib3.")
@@ -147,6 +150,18 @@ def send_order(symbol, side, volume, price, sl, tp, comment=''):
     }
     res = mt5.order_send(req)
     print('order_send result:', res)
+
+    # Send Telegram notification (async)
+    import asyncio
+    async def send_telegram():
+        try:
+            await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text='Trade Activated')
+        except Exception as e:
+            print(f"Telegram notification failed: {e}")
+    try:
+        asyncio.run(send_telegram())
+    except Exception as e:
+        print(f"Telegram notification failed (asyncio): {e}")
     return res
 
  # Telegram bot and approval logic removed
@@ -300,6 +315,18 @@ def main():
         return True
 
     market_open = None  # Unknown at start
+    import asyncio
+    async def send_telegram_market_open():
+        try:
+            await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text='Market Opened. Bot Activated.')
+        except Exception as e:
+            print(f"Telegram notification failed: {e}")
+
+    async def send_telegram_market_closed():
+        try:
+            await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text='Market Closed. Bot Paused.')
+        except Exception as e:
+            print(f"Telegram notification failed: {e}")
     try:
         while True:
             currently_open = is_market_open()
@@ -309,11 +336,19 @@ def main():
                 if not market_open:
                     # Market just opened
                     print("Market opened. Trading resumed.")
+                    try:
+                        asyncio.run(send_telegram_market_open())
+                    except Exception as e:
+                        print(f"Telegram notification failed (asyncio): {e}")
                 eng.scan_and_maybe_trade()
             else:
                 if market_open:
                     # Market just closed
                     print("Market closed. Trading paused.")
+                    try:
+                        asyncio.run(send_telegram_market_closed())
+                    except Exception as e:
+                        print(f"Telegram notification failed (asyncio): {e}")
                 # Do not trade when market is closed
             market_open = currently_open
             time.sleep(30)
