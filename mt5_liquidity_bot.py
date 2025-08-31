@@ -8,8 +8,7 @@ import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 import threading
-from telegram import Bot, Update
-from telegram.ext import Updater, MessageHandler, Filters, CallbackContext
+ # Telegram imports removed
 import warnings
 import os, json
 
@@ -53,8 +52,7 @@ def get_max_risk_per_trade_pct():
     return STANDARD_RISK_PER_TRADE_PCT
 
 # Telegram settings
-TELEGRAM_BOT_TOKEN = '8177282153:AAHf7HJlNwUG23JMJa9dvnEstihel68VjPU'
-TELEGRAM_CHAT_ID = '8426349009'  # integer or string
+ # Telegram settings removed
 
 # Suppress specific warnings globally
 warnings.filterwarnings("ignore", message="python-telegram-bot is using upstream urllib3.")
@@ -151,32 +149,7 @@ def send_order(symbol, side, volume, price, sl, tp, comment=''):
     print('order_send result:', res)
     return res
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-
-approval_event = threading.Event()
-approval_result = {'approved': False}
-
-def send_trade_approval_request(trade_info: str):
-    msg = f"Trade approval requested:\n{trade_info}\nReply with 'approve' or 'reject'."
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-
-def handle_message(update: Update, context: CallbackContext):
-    text = update.message.text.lower().strip()
-    if text == 'approve':
-        approval_result['approved'] = True
-        approval_event.set()
-        context.bot.send_message(chat_id=update.effective_chat.id, text='Trade approved.')
-    elif text == 'reject':
-        approval_result['approved'] = False
-        approval_event.set()
-        context.bot.send_message(chat_id=update.effective_chat.id, text='Trade rejected.')
-
-def telegram_polling():
-    updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(MessageHandler(Filters.text & (~Filters.command), handle_message))
-    updater.start_polling()
-    # Removed updater.idle() to avoid signal warning in background thread
+ # Telegram bot and approval logic removed
 
 # ========== Pivots (simple) ==========
 def find_pivots(df, L, R):
@@ -189,6 +162,19 @@ def find_pivots(df, L, R):
         if np.nanmin(window_l) == l[i] and (window_l==l[i]).sum()==1:
             piv_lo[i] = True
     return piv_hi, piv_lo
+
+def calculate_atr(df, period=14):
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(window=period, min_periods=1).mean()
+    return atr
 
 # ========== ENGINE ==========
 class Engine:
@@ -228,8 +214,17 @@ class Engine:
         exposure = current_exposure_lots(symbol)
         if exposure >= MAX_TOTAL_EXPOSURE_LOTS:
             print(f'Trade blocked: exposure {exposure} lots >= {MAX_TOTAL_EXPOSURE_LOTS}'); return
-        info = mt5.symbol_info(symbol); digits = info.digits; pip = 0.0001 if digits>=4 else 0.01
-        stop_pips = DEFAULT_SL_PIPS
+        info = mt5.symbol_info(symbol)
+        digits = info.digits
+        pip = 0.0001 if digits >= 4 else 0.01
+        # Calculate ATR-based stop loss
+        df_atr = fetch_rates(symbol, 100)
+        atr_mult = 1.5  # ATR multiplier for stop loss
+        if df_atr.empty:
+            print('ATR data unavailable; skipping trade.')
+            return
+        atr = calculate_atr(df_atr).iloc[-1]
+        stop_pips = atr * atr_mult / pip
         tick = mt5.symbol_info_tick(symbol)
         entry = tick.ask if lvl.kind=='low' else tick.bid
         side = 'buy' if lvl.kind=='low' else 'sell'
@@ -275,98 +270,21 @@ class Engine:
             tp = float(df['low'].iloc[next_pivot_idx]) if next_pivot_idx is not None else entry - stop_pips * pip * DEFAULT_TP_MULT
             sl = entry + stop_pips * pip
 
-        # --- Telegram approval required before sending order ---
-        side_emoji = '🟢 BUY' if side == 'buy' else '🔴 SELL'
-        trade_info = (
-            f"🚨 TRADE SIGNAL 🚨\n"
-            f"Symbol: {symbol}\n"
-            f"Side: {side_emoji}\n"
-            f"Lots: {lots}\n"
-            f"Entry: {entry}\n"
-            f"SL: {sl} 🛑\n"
-            f"TP: {tp} 🎯\n"
-            f"Risk: ${risk_amount:,.2f} ({risk_pct:.2f}% of balance, open risk: {open_risk_pct:.2f}%) 💸\n"
-            "\nReply with 'approve' ✅ or 'reject' ❌."
-        )
-        send_trade_approval_request(trade_info)
-        approval_event.clear()
-        print(f'Waiting for trade approval via Telegram... (risk per trade: {risk_pct}%, open risk: {open_risk_pct:.2f}%, risk: ${risk_amount:,.2f})')
-        approved = approval_event.wait(timeout=120)
-        if not approved or not approval_result['approved']:
-            print('Trade rejected by user or timed out.')
-            return
-        print('Trade approved by user. Placing order...')
-        send_order(symbol, side, lots, entry, sl, tp, comment='swing_fill_riskctrl')
+        # --- Telegram approval removed: auto-approve all trades ---
+        print(f'Auto-approving trade for {symbol} {side} {lots} lots at {entry}')
+        send_order(symbol, side, lots, entry, sl, tp, comment="swing_fill_riskctrl")
 
 # --- Monitor open trades and move SL to BE when price moves in favor by SL distance ---
-def trailing_stop_monitor():
-    print('Trailing stop monitor started.')
-    while True:
-        for symbol in SYMBOLS:
-            positions = mt5.positions_get(symbol=symbol)
-            if positions:
-                for pos in positions:
-                    entry = pos.price_open
-                    sl = pos.sl
-                    volume = pos.volume
-                    ticket = pos.ticket
-                    side = 'buy' if pos.type == mt5.POSITION_TYPE_BUY else 'sell'
-                    info = mt5.symbol_info(symbol)
-                    pip = 0.0001 if info.digits >= 4 else 0.01
-                    # Use 50% of initial SL distance as trailing distance
-                    trailing_dist = abs(entry - (entry - DEFAULT_SL_PIPS * pip)) * 0.5
-                    tick = mt5.symbol_info_tick(symbol)
-                    price = tick.bid if side == 'sell' else tick.ask
-                    # Calculate new trailing SL
-                    if side == 'buy':
-                        new_sl = price - trailing_dist
-                        # Only trail forward, never backward
-                        if new_sl > sl and new_sl < price:
-                            print(f'Trailing SL for BUY ticket {ticket} to {new_sl}')
-                            mt5.order_send({
-                                'action': mt5.TRADE_ACTION_SLTP,
-                                'position': ticket,
-                                'sl': new_sl,
-                                'tp': pos.tp,
-                                'symbol': symbol,
-                                'volume': volume,
-                                'magic': MAGIC,
-                                'comment': 'Trailing SL',
-                                'type_time': mt5.ORDER_TIME_GTC,
-                                'type_filling': mt5.ORDER_FILLING_FOK
-                            })
-                    else:
-                        new_sl = price + trailing_dist
-                        if (sl == 0 or new_sl < sl) and new_sl > price:
-                            print(f'Trailing SL for SELL ticket {ticket} to {new_sl}')
-                            mt5.order_send({
-                                'action': mt5.TRADE_ACTION_SLTP,
-                                'position': ticket,
-                                'sl': new_sl,
-                                'tp': pos.tp,
-                                'symbol': symbol,
-                                'volume': volume,
-                                'magic': MAGIC,
-                                'comment': 'Trailing SL',
-                                'type_time': mt5.ORDER_TIME_GTC,
-                                'type_filling': mt5.ORDER_FILLING_FOK
-                            })
-        time.sleep(5)
 
 # ========== RUN ==========
 
 def main():
     init_mt5(); eng = Engine()
-    # Start Telegram polling in a background thread
-    telegram_thread = threading.Thread(target=telegram_polling, daemon=True)
-    telegram_thread.start()
-    # Start trailing stop monitor in a background thread
-    trailing_thread = threading.Thread(target=trailing_stop_monitor, daemon=True)
-    trailing_thread.start()
+    # Trailing stop monitor removed
 
     def is_market_open():
         # XAUUSD: open Sun 22:00 UTC, close Fri 21:00 UTC (typical for gold/forex)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         weekday = now.weekday()  # Monday=0, Sunday=6
         hour = now.hour
         minute = now.minute
@@ -384,13 +302,11 @@ def main():
             if currently_open:
                 if not market_open:
                     # Market just opened
-                    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Market is now OPEN. Bot resumed trading.")
                     print("Market opened. Trading resumed.")
                 eng.scan_and_maybe_trade()
             else:
                 if market_open:
                     # Market just closed
-                    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Market is now CLOSED. Bot paused trading.")
                     print("Market closed. Trading paused.")
                 # Do not trade when market is closed
             market_open = currently_open
