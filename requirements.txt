@@ -1,0 +1,7 @@
+MetaTrader5
+pandas
+numpy
+plotly
+pytz
+streamlit
+python-telegram-bot

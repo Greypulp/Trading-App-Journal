@@ -1,4 +1,4 @@
- # dashboard.py (Streamlit) - includes risk management metrics and live limits
+# dashboard.py (Streamlit) - includes risk management metrics and live limits
 import os, time, json
 from datetime import datetime, timezone
 import streamlit as st
@@ -14,106 +14,19 @@ TIMEFRAME_MAP = {'M15': mt5.TIMEFRAME_M15, 'H1': mt5.TIMEFRAME_H1}
 # --- Sidebar Controls ---
 with st.sidebar:
     st.title("Controls & Risk Settings")
-    selected_tab = st.radio("Select View", ["Dashboard", "Trading Journal", "Backtesting"], key="main_tab")
-    if selected_tab == "Backtesting":
-        pass
-    else:
-        symbol = st.selectbox("Symbol", ["XAUUSD"], index=0, key="symbol_select")
-        timeframe = st.selectbox("Timeframe", list(TIMEFRAME_MAP.keys()), index=0, key="tf_select")
-        bars = st.slider("Bars to Load", min_value=500, max_value=3000, value=2000, step=100, key="bars_slider")
-        st.markdown("---")
-        st.subheader("Risk Controls")
-        max_daily_dd = st.number_input("Max Daily Drawdown (%)", min_value=1.0, max_value=20.0, value=5.0, step=0.1, key="max_dd_input")
-        max_risk_trade = st.number_input("Max Risk per Trade (%)", min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="max_risk_input")
-        max_total_exposure = st.number_input("Max Total Exposure (lots)", min_value=0.1, max_value=20.0, value=5.0, step=0.1, key="max_exposure_input")
-        st.markdown("---")
-        st.subheader("Pivot Detection Settings")
-        L = st.slider("Pivot Left Bars (L)", min_value=5, max_value=30, value=15, step=1, key="pivot_L")
-        R = st.slider("Pivot Right Bars (R)", min_value=5, max_value=30, value=10, step=1, key="pivot_R")
-# --- Page Routing ---
-if selected_tab == "Backtesting":
-    from backtest_logic import PivotATRBacktester
-    st.title("📊 Strategy Backtesting")
-    st.markdown("""
-    Upload your historical data CSV and test your strategy logic. Results and metrics will be displayed below.
-    """)
-    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"], key="backtest_csv")
-    if uploaded_file:
-        df = pd.read_csv(uploaded_file)
-        st.write("Data Preview:")
-        st.dataframe(df.head())
-        st.subheader("Column Mapping")
-        columns = df.columns.tolist()
-        col_time = st.selectbox("Time column", columns, index=0, key="bt_col_time")
-        col_open = st.selectbox("Open column", columns, index=1 if len(columns)>1 else 0, key="bt_col_open")
-        col_high = st.selectbox("High column", columns, index=2 if len(columns)>2 else 0, key="bt_col_high")
-        col_low = st.selectbox("Low column", columns, index=3 if len(columns)>3 else 0, key="bt_col_low")
-        col_close = st.selectbox("Close column", columns, index=4 if len(columns)>4 else 0, key="bt_col_close")
-        df_bt = df[[col_time, col_open, col_high, col_low, col_close]].copy()
-        df_bt.columns = ['time', 'open', 'high', 'low', 'close']
-        df_bt['time'] = pd.to_datetime(df_bt['time'])
-        df_bt.set_index('time', inplace=True)
-        st.subheader("Backtest Parameters")
-        swing_left = st.number_input("Swing Left (pivot lookback)", min_value=1, max_value=50, value=15, key="bt_swing_left")
-        swing_right = st.number_input("Swing Right (pivot lookforward)", min_value=1, max_value=50, value=10, key="bt_swing_right")
-        atr_period = st.number_input("ATR Period", min_value=1, max_value=100, value=14, key="bt_atr_period")
-        atr_mult = st.number_input("ATR Multiplier (for SL)", min_value=0.1, max_value=10.0, value=1.5, step=0.1, key="bt_atr_mult")
-        risk_pct = st.number_input("Risk % per Trade", min_value=0.01, max_value=10.0, value=0.5, step=0.01, key="bt_risk_pct")
-        # Use MT5 live balance if available
-        live_balance = None
-        try:
-            import MetaTrader5 as mt5
-            acc = mt5.account_info()
-            if acc:
-                live_balance = acc.balance
-        except Exception:
-            pass
-        initial_balance = st.number_input(
-            "Initial Balance",
-            min_value=100.0,
-            max_value=1000000.0,
-            value=live_balance if live_balance is not None else 10000.0,
-            step=100.0,
-            key="bt_initial_balance"
-        )
-        contract_size = st.number_input("Contract Size", min_value=1, max_value=100000, value=100, key="bt_contract_size")
-        pip_size = st.number_input("Pip Size", min_value=0.00001, max_value=1.0, value=0.01, step=0.00001, format="%f", key="bt_pip_size")
-        min_lot = st.number_input("Min Lot Size", min_value=0.001, max_value=1.0, value=0.01, step=0.001, key="bt_min_lot")
-        if st.button("Run Backtest", key="bt_run_btn"):
-            with st.spinner("Running backtest..."):
-                bt = PivotATRBacktester(
-                    df_bt,
-                    swing_left=swing_left,
-                    swing_right=swing_right,
-                    atr_period=atr_period,
-                    atr_mult=atr_mult,
-                    risk_pct=risk_pct,
-                    initial_balance=initial_balance,
-                    contract_size=contract_size,
-                    pip_size=pip_size,
-                    min_lot=min_lot
-                )
-                trades = bt.run()
-                st.success(f"Backtest complete. Final balance: {bt.balance:,.2f}")
-                st.write(f"Total trades: {len(trades)}")
-                st.dataframe(trades)
-                if not trades.empty:
-                    st.line_chart(trades['profit'].cumsum())
-                    # --- Risk Metrics ---
-                    wins = trades[trades['profit']>0]['profit'].sum() if not trades.empty else 0.0
-                    losses = -trades[trades['profit']<0]['profit'].sum() if not trades.empty else 0.0
-                    win_rate = (trades['profit']>0).mean()*100 if not trades.empty else 0.0
-                    profit_factor = (wins / losses) if losses>0 else float('inf') if wins>0 else 0.0
-                    eq = trades['profit'].cumsum() + initial_balance if not trades.empty else [initial_balance]
-                    peak = np.maximum.accumulate(eq)
-                    dd = ((peak - eq).max() / peak.max())*100 if len(eq)>0 and peak.max()>0 else 0.0
-                    st.markdown("### Backtest Risk Metrics")
-                    st.write(f"**Win Rate:** {win_rate:.2f}%")
-                    st.write(f"**Profit Factor:** {profit_factor:.2f}")
-                    st.write(f"**Max Drawdown:** {dd:.2f}%")
-                    st.write(f"**Total Net Profit:** {eq.iloc[-1] - initial_balance:,.2f}")
-    else:
-        st.info("Please upload a CSV file to begin backtesting.")
+    selected_tab = st.radio("Select View", ["Dashboard", "Trading Journal"], key="main_tab")
+    symbol = st.selectbox("Symbol", ["XAUUSD"], index=0, key="symbol_select")
+    timeframe = st.selectbox("Timeframe", list(TIMEFRAME_MAP.keys()), index=0, key="tf_select")
+    bars = st.slider("Bars to Load", min_value=500, max_value=3000, value=2000, step=100, key="bars_slider")
+    st.markdown("---")
+    st.subheader("Risk Controls")
+    max_daily_dd = st.number_input("Max Daily Drawdown (%)", min_value=1.0, max_value=20.0, value=5.0, step=0.1, key="max_dd_input")
+    max_risk_trade = st.number_input("Max Risk per Trade (%)", min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="max_risk_input")
+    max_total_exposure = st.number_input("Max Total Exposure (lots)", min_value=0.1, max_value=20.0, value=5.0, step=0.1, key="max_exposure_input")
+    st.markdown("---")
+    st.subheader("Pivot Detection Settings")
+    L = st.slider("Pivot Left Bars (L)", min_value=5, max_value=30, value=15, step=1, key="pivot_L")
+    R = st.slider("Pivot Right Bars (R)", min_value=5, max_value=30, value=10, step=1, key="pivot_R")
 
 DEFAULT_SYMBOL = "XAUUSD"
 TIMEFRAME_MAP = {'M15': mt5.TIMEFRAME_M15, 'H1': mt5.TIMEFRAME_H1}
@@ -153,23 +66,90 @@ def get_open_positions_df(symbol):
     return pd.DataFrame(rows, columns=['Ticket','Symbol','Volume','Open','SL','TP','Profit','Time'])
 
 def get_recent_trades_df(days=30):
-
-    now = time.time()
-    frm = now - days * 86400
+    now=time.time(); frm=now-days*86400
     deals = mt5.history_deals_get(frm, now)
-    if not deals:
-        return pd.DataFrame()
-    rows = []
-    for d in deals:
-        rows.append([d.ticket, d.symbol, d.volume, d.price, d.profit, datetime.fromtimestamp(d.time, timezone.utc)])
+    if not deals: return pd.DataFrame()
+    rows=[] 
+    for d in deals: rows.append([d.ticket, d.symbol, d.volume, d.price, d.profit, datetime.fromtimestamp(d.time, timezone.utc)])
     return pd.DataFrame(rows, columns=['Ticket','Symbol','Volume','Price','Profit','Time'])
 
 
-    # ...existing code...
+    # --- Streamlit-native Summary Section ---
+    st.markdown("""
+        <style>
+        .stMetric {
+            font-size: 0.97em !important;
+            padding: 2px 6px 2px 6px;
+            margin-bottom: 0 !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    # Only show warning if no data for today and no fallback data
+    if df.empty:
+        st.warning("No data available for today or any fallback date.")
+
+    summary_cols = st.columns(6)
+    summary_cols[0].metric('💰 Balance', f"${balance:,.2f}")
+    summary_cols[1].metric('📊 Exposure (lots)', f"{exposure_lots:.2f}")
+    summary_cols[2].metric('💵 Realized P&L Today', f"${realized_today:,.2f}", delta=f"{realized_pct:.2f}%", delta_color="normal" if realized_today>=0 else "inverse")
+    summary_cols[3].metric('📆 Weekly P&L', f"${weekly_pnl:,.2f}")
+    summary_cols[4].metric('🛡️ Drawdown %', f"{dd:.2f}%")
+    summary_cols[5].metric('🧮 Example Lot', f"{example_lot:.2f}")
+
+    extra_cols = st.columns(3)
+    extra_cols[0].metric('📈 Account Growth (7d)', f"{account_growth:.2f}%")
+    extra_cols[1].metric('✅ Win Rate', f"{win_rate:.1f}%")
+    extra_cols[2].metric('📊 Profit Factor', f"{profit_factor:.2f}")
+
+    st.markdown('---')
+
+    col1, _ = st.columns([2,1], gap="large")
+
+    with col1:
+        st.header('📈 Today\'s Price Chart')
+        st.caption('Live price chart with pivots and risk overlays. Data auto-refreshes.')
+        fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
+        hi_idx = np.where(piv_hi.values)[0]; lo_idx = np.where(piv_lo.values)[0]
+        if len(hi_idx):
+            fig.add_trace(go.Scatter(x=df.index[hi_idx], y=df['high'].iloc[hi_idx], mode='markers', marker=dict(color='red', size=8), name='Pivot Highs'))
+        if len(lo_idx):
+            fig.add_trace(go.Scatter(x=df.index[lo_idx], y=df['low'].iloc[lo_idx], mode='markers', marker=dict(color='green', size=8), name='Pivot Lows'))
+        for idx in hi_idx:
+            price = df['high'].iat[idx]; top,bottom = price*(1+0.001*BOX_WID), price; t0=df.index[idx]; t1=df.index[-1]
+            fig.add_shape(type='rect', x0=t0, x1=t1, y0=bottom, y1=top, fillcolor='rgba(200,50,50,0.12)', line_width=0)
+        for idx in lo_idx:
+            price = df['low'].iat[idx]; top,bottom = price, price*(1-0.001*BOX_WID); t0=df.index[idx]; t1=df.index[-1]
+            fig.add_shape(type='rect', x0=t0, x1=t1, y0=bottom, y1=top, fillcolor='rgba(50,180,80,0.12)', line_width=0)
+        fig.update_layout(
+            xaxis_rangeslider_visible=True,
+            xaxis_title='Time',
+            yaxis_title='Price',
+            margin=dict(l=10, r=10, t=30, b=10),
+            plot_bgcolor='#f8fafc',
+            paper_bgcolor='#f8fafc',
+            font=dict(size=13)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            st.warning(f'Could not save config: {e}')
+        st.caption('Adjust risk and exposure to match your trading plan.')
+        st.markdown('---')
+    refresh = st.button('🔄 Refresh Data', help='Reload all data')
+    if refresh:
+        st.rerun()
 
 with st.sidebar.expander('Chart Display Options', expanded=True):
     st.write('Showing only today\'s data.')
     st.caption('Adjust symbol, timeframe, and bars above.')
+
+with st.sidebar.expander('Risk Controls', expanded=False):
+    st.write(f"Max daily drawdown: {max_daily_dd}%")
+    st.write(f"Max risk per trade: {max_risk_trade}% (example lot: {max_risk_trade})")
+    st.write(f"Max total exposure (lots): {max_total_exposure}")
 
 # --- Account Details in Sidebar ---
 acc = get_account_info()
@@ -183,115 +163,114 @@ if acc:
 else:
     st.sidebar.warning('No account info available.')
 
+tf = TIMEFRAME_MAP[timeframe]
 
-# Only run live data code if required variables are defined (i.e., not on Backtesting page)
-if all(x in globals() for x in ['timeframe', 'symbol', 'bars']):
-    tf = TIMEFRAME_MAP[timeframe]
-    df = fetch_rates(symbol, tf, bars)
-    if df.empty:
-        st.error('No data from MT5'); st.stop()
-    # Ensure df.index is timezone-aware UTC for safe comparison
-    if df.index.tz is None:
-        df.index = df.index.tz_localize('UTC')
-    # Filter df to only today's data using UTC+3:00 as the trading day start
-    import pytz
-    tz_moscow = timezone.utc if not hasattr(pytz, 'timezone') else pytz.timezone('Etc/GMT-3')
-    now_utc = datetime.now(timezone.utc)
-    now = now_utc.astimezone(tz_moscow)
-    today_start = now.replace(hour=3, minute=0, second=0, microsecond=0)
-    if now.hour < 3:
-        today_start = today_start - pd.Timedelta(days=1)
-    today_start_utc = today_start.astimezone(timezone.utc)
-    next_day_start_utc = (today_start + pd.Timedelta(days=1)).astimezone(timezone.utc)
-    df_today = df[(df.index >= today_start_utc) & (df.index < next_day_start_utc)]
-    if df_today.empty:
-        # Find the most recent previous day with data (using UTC+3 day boundaries)
-        prev_day = today_start - pd.Timedelta(days=1)
-        while prev_day > df.index.min():
-            prev_start_utc = prev_day.astimezone(timezone.utc)
-            prev_end_utc = (prev_day + pd.Timedelta(days=1)).astimezone(timezone.utc)
-            day_df = df[(df.index >= prev_start_utc) & (df.index < prev_end_utc)]
-            if not day_df.empty:
-                df_today = day_df
-                st.warning(f"No data for today. Showing data for {prev_day.strftime('%Y-%m-%d')} (UTC+3) instead.")
-                break
-            prev_day -= pd.Timedelta(days=1)
-        else:
-            st.error('No data for today or any previous day from MT5'); st.stop()
-    df = df_today
+df = fetch_rates(symbol, tf, bars)
+if df.empty:
+    st.error('No data from MT5'); st.stop()
 
+# Ensure df.index is timezone-aware UTC for safe comparison
+if df.index.tz is None:
+    df.index = df.index.tz_localize('UTC')
+
+# Filter df to only today's data using UTC+3:00 as the trading day start
+import pytz
+tz_moscow = timezone.utc if not hasattr(pytz, 'timezone') else pytz.timezone('Etc/GMT-3')
+now_utc = datetime.now(timezone.utc)
+now = now_utc.astimezone(tz_moscow)
+today_start = now.replace(hour=3, minute=0, second=0, microsecond=0)
+if now.hour < 3:
+    today_start = today_start - pd.Timedelta(days=1)
+today_start_utc = today_start.astimezone(timezone.utc)
+next_day_start_utc = (today_start + pd.Timedelta(days=1)).astimezone(timezone.utc)
+df_today = df[(df.index >= today_start_utc) & (df.index < next_day_start_utc)]
+if df_today.empty:
+    # Find the most recent previous day with data (using UTC+3 day boundaries)
+    prev_day = today_start - pd.Timedelta(days=1)
+    while prev_day > df.index.min():
+        prev_start_utc = prev_day.astimezone(timezone.utc)
+        prev_end_utc = (prev_day + pd.Timedelta(days=1)).astimezone(timezone.utc)
+        day_df = df[(df.index >= prev_start_utc) & (df.index < prev_end_utc)]
+        if not day_df.empty:
+            df_today = day_df
+            st.warning(f"No data for today. Showing data for {prev_day.strftime('%Y-%m-%d')} (UTC+3) instead.")
+            break
+        prev_day -= pd.Timedelta(days=1)
+    else:
+        st.error('No data for today or any previous day from MT5'); st.stop()
+df = df_today
 
 
 # --- Data Preparation ---
-if selected_tab == "Dashboard":
-    piv_hi, piv_lo = find_pivots(df, L, R)
+piv_hi, piv_lo = find_pivots(df, L, R)
 
-    positions_df = get_open_positions_df(symbol)
-    trades_df = get_recent_trades_df(days=30)
-    balance = acc['Balance'] if acc else 0.0
+positions_df = get_open_positions_df(symbol)
+trades_df = get_recent_trades_df(days=30)
+balance = acc['Balance'] if acc else 0.0
 
-    now = datetime.now(timezone.utc)
-    start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-    deals_today = mt5.history_deals_get(start.timestamp(), time.time()) or []
-    realized_today = sum(getattr(d,'profit',0.0) for d in deals_today)
-    realized_pct = (realized_today / balance * 100.0) if balance else 0.0
+now = datetime.now(timezone.utc)
+start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+deals_today = mt5.history_deals_get(start.timestamp(), time.time()) or []
+realized_today = sum(getattr(d,'profit',0.0) for d in deals_today)
+realized_pct = (realized_today / balance * 100.0) if balance else 0.0
 
-    closed = trades_df[trades_df['Symbol']==symbol] if not trades_df.empty else pd.DataFrame()
-    lastN = 50; sample = closed.tail(lastN)
-    wins = sample[sample['Profit']>0]['Profit'].sum() if not sample.empty else 0.0
-    losses = -sample[sample['Profit']<0]['Profit'].sum() if not sample.empty else 0.0
-    win_rate = (sample['Profit']>0).mean()*100 if not sample.empty else 0.0
-    profit_factor = (wins / losses) if losses>0 else float('inf') if wins>0 else 0.0
+closed = trades_df[trades_df['Symbol']==symbol] if not trades_df.empty else pd.DataFrame()
+lastN = 50; sample = closed.tail(lastN)
+wins = sample[sample['Profit']>0]['Profit'].sum() if not sample.empty else 0.0
+losses = -sample[sample['Profit']<0]['Profit'].sum() if not sample.empty else 0.0
+win_rate = (sample['Profit']>0).mean()*100 if not sample.empty else 0.0
+profit_factor = (wins / losses) if losses>0 else float('inf') if wins>0 else 0.0
 
-    # --- Weekly P&L and Account Growth ---
-    week_ago = now - pd.Timedelta(days=7)
-    deals_week = [d for d in mt5.history_deals_get(week_ago.timestamp(), time.time()) or []]
-    weekly_pnl = sum(getattr(d, 'profit', 0.0) for d in deals_week)
+# --- Weekly P&L and Account Growth ---
+week_ago = now - pd.Timedelta(days=7)
+deals_week = [d for d in mt5.history_deals_get(week_ago.timestamp(), time.time()) or []]
+weekly_pnl = sum(getattr(d, 'profit', 0.0) for d in deals_week)
 
-    # Estimate balance 7 days ago (current balance - closed P&L since then)
-    balance_7d_ago = balance - weekly_pnl
-    account_growth = ((balance - balance_7d_ago) / balance_7d_ago * 100.0) if balance_7d_ago else 0.0
+# Estimate balance 7 days ago (current balance - closed P&L since then)
+balance_7d_ago = balance - weekly_pnl
+account_growth = ((balance - balance_7d_ago) / balance_7d_ago * 100.0) if balance_7d_ago else 0.0
 
+try:
+    eq = (sample['Profit'].cumsum() + balance).ffill().values if not sample.empty else np.array([balance])
+    peak = np.maximum.accumulate(eq); dd = ((peak - eq).max() / peak.max())*100 if len(eq)>0 and peak.max()>0 else 0.0
+except Exception:
+    dd = 0.0
+
+exposure_lots = positions_df['Volume'].sum() if not positions_df.empty else 0.0
+
+
+# --- Example lot size calculation for current risk setting ---
+info = mt5.symbol_info(symbol); digits = info.digits if info else 5
+pip = 0.0001 if digits>=4 else 0.01
+default_sl = 50
+def example_lot_for_risk(balance, stop_pips, risk_pct):
     try:
-        eq = (sample['Profit'].cumsum() + balance).ffill().values if not sample.empty else np.array([balance])
-        peak = np.maximum.accumulate(eq); dd = ((peak - eq).max() / peak.max())*100 if len(eq)>0 and peak.max()>0 else 0.0
+        contract = info.trade_contract_size if info and hasattr(info,'trade_contract_size') else 100000
+        pip_val = contract * (0.0001 if digits>=4 else 0.01)
+        risk_amount = balance * (risk_pct/100.0)
+        lot = risk_amount / (stop_pips * pip_val)
+        return max(0.01, round(lot,2)), risk_amount, pip_val
     except Exception:
-        dd = 0.0
+        return 0.01, 0.0, 0.0
 
-    exposure_lots = positions_df['Volume'].sum() if not positions_df.empty else 0.0
+example_lot, example_risk_usd, example_pip_val = example_lot_for_risk(balance, default_sl, max_risk_trade)
 
-    # --- Example lot size calculation for current risk setting ---
-    info = mt5.symbol_info(symbol); digits = info.digits if info else 5
-    pip = 0.0001 if digits>=4 else 0.01
-    default_sl = 50
-    def example_lot_for_risk(balance, stop_pips, risk_pct):
-        try:
-            contract = info.trade_contract_size if info and hasattr(info,'trade_contract_size') else 100000
-            pip_val = contract * (0.0001 if digits>=4 else 0.01)
-            risk_amount = balance * (risk_pct/100.0)
-            lot = risk_amount / (stop_pips * pip_val)
-            return max(0.01, round(lot,2)), risk_amount, pip_val
-        except Exception:
-            return 0.01, 0.0, 0.0
-
-    example_lot, example_risk_usd, example_pip_val = example_lot_for_risk(balance, default_sl, max_risk_trade)
-
-    # --- Display autocalculated lot size and formula in sidebar ---
-    with st.sidebar.expander('🧮 Lot Size Calculation', expanded=False):
-        st.write(f"**Autocalculated lot size:** <span style='color:#2563eb;font-size:1.2em'>{example_lot:.2f}</span>", unsafe_allow_html=True)
-        st.write(f"**Risk in $:** <span style='color:#eab308;font-size:1.1em'>${example_risk_usd:,.2f}</span> (for {max_risk_trade:.2f}% of balance)", unsafe_allow_html=True)
-        st.caption(f"For risk = {max_risk_trade:.2f}% of balance, SL = {default_sl} pips.")
-        st.markdown('''
-        **Formula:**
-        
-        `lot = (balance * risk% / 100) / (stop_loss_pips * pip_value_per_lot)`
-        
-        Where:
-        - `balance` = account balance
-        - `risk%` = max risk per trade (from above)
-        - `stop_loss_pips` = default 50
-        - `pip_value_per_lot` = contract size × pip size
-        ''')
+# --- Display autocalculated lot size and formula in sidebar ---
+with st.sidebar.expander('🧮 Lot Size Calculation', expanded=False):
+    st.write(f"**Autocalculated lot size:** <span style='color:#2563eb;font-size:1.2em'>{example_lot:.2f}</span>", unsafe_allow_html=True)
+    st.write(f"**Risk in $:** <span style='color:#eab308;font-size:1.1em'>${example_risk_usd:,.2f}</span> (for {max_risk_trade:.2f}% of balance)", unsafe_allow_html=True)
+    st.caption(f"For risk = {max_risk_trade:.2f}% of balance, SL = {default_sl} pips.")
+    st.markdown('''
+    **Formula:**
+    
+    `lot = (balance * risk% / 100) / (stop_loss_pips * pip_value_per_lot)`
+    
+    Where:
+    - `balance` = account balance
+    - `risk%` = max risk per trade (from above)
+    - `stop_loss_pips` = default 50
+    - `pip_value_per_lot` = contract size × pip size
+    ''')
 
 
 
@@ -299,17 +278,17 @@ if selected_tab == "Dashboard":
 if selected_tab == "Dashboard":
     # --- Streamlit-native Summary Section ---
     with st.container():
-        summary_cols = st.columns(5)
-        summary_cols[0].metric('💰 Balance', f"${balance:,.2f}")    
-        summary_cols[1].metric('💵 Realized P&L Today', f"${realized_today:,.2f}", delta=f"{realized_pct:.2f}%", delta_color="normal" if realized_today>=0 else "inverse")
-        summary_cols[2].metric('📆 Weekly P&L', f"${weekly_pnl:,.2f}")
-        summary_cols[3].metric('✅ Win Rate', f"{win_rate:.1f}%")
-        summary_cols[4].metric('📈 Account Growth (7d)', f"{account_growth:.2f}%")        
-        extra_cols = st.columns(4)
-        extra_cols[0].metric('🧮 Example Lot', f"{example_lot:.2f}")
-        extra_cols[1].metric('📊 Exposure (lots)', f"{exposure_lots:.2f}")
-        extra_cols[2].metric('🛡️ Drawdown %', f"{dd:.2f}%")
-        extra_cols[3].metric('📊 Profit Factor', f"{profit_factor:.2f}")
+        summary_cols = st.columns(6)
+        summary_cols[0].metric('💰 Balance', f"${balance:,.2f}")
+        summary_cols[1].metric('📊 Exposure (lots)', f"{exposure_lots:.2f}")
+        summary_cols[2].metric('💵 Realized P&L Today', f"${realized_today:,.2f}", delta=f"{realized_pct:.2f}%", delta_color="normal" if realized_today>=0 else "inverse")
+        summary_cols[3].metric('📆 Weekly P&L', f"${weekly_pnl:,.2f}")
+        summary_cols[4].metric('🛡️ Drawdown %', f"{dd:.2f}%")
+        summary_cols[5].metric('🧮 Example Lot', f"{example_lot:.2f}")
+        extra_cols = st.columns(3)
+        extra_cols[0].metric('📈 Account Growth (7d)', f"{account_growth:.2f}%")
+        extra_cols[1].metric('✅ Win Rate', f"{win_rate:.1f}%")
+        extra_cols[2].metric('📊 Profit Factor', f"{profit_factor:.2f}")
         st.markdown('<hr style="margin-top:8px;margin-bottom:8px;border:0;border-top:1px solid #e0e7ef;">', unsafe_allow_html=True)
         col1, col2 = st.columns([2,1], gap="small")
         with col1:
@@ -336,7 +315,7 @@ if selected_tab == "Dashboard":
                 paper_bgcolor='#f8fafc',
                 font=dict(size=13)
             )
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
         with col2:
             st.subheader('📂 Open Positions')
             if not positions_df.empty:
@@ -465,7 +444,7 @@ elif selected_tab == "Trading Journal":
     # Build a dict for fast lookup
     pnl_map = {row['Date']: row for _, row in daily_pnl.iterrows()}
 
-    # --- Calendar grid with tooltips (static, not interactive) ---
+    # --- Calendar grid with tooltips ---
     st.markdown('<div class="journal-calendar-card">', unsafe_allow_html=True)
     week_days = ['Mon','Tue','Wed','Thu','Fri']
     num_days = len(week_days)
@@ -476,10 +455,12 @@ elif selected_tab == "Trading Journal":
         cols = st.columns(num_days)
         for day in range(num_days):
             d = days[week*7+day]
+            # Only show if weekday is Mon-Fri (0-4)
             if d.weekday() > 4:
                 continue
             cell = ''
             date_str = f"<div class='journal-date'>{d.day}</div>"
+            # Tooltip logic: show P&L and note if available
             note_str = st.session_state['journal_notes'].get(d.strftime('%Y-%m-%d'), "")
             def escape_html(text):
                 import html
@@ -539,13 +520,9 @@ elif selected_tab == "Trading Journal":
         if not selected_date_trades.empty:
             trades_sorted = selected_date_trades.sort_values('Time', ascending=False).copy()
             st.markdown(f'<div style="font-size:1.05em;color:#2563eb;font-weight:500;margin-bottom:4px;">Showing trades for <b>{selected_date.strftime("%Y-%m-%d")}</b></div>', unsafe_allow_html=True)
-            if 'Time' in trades_sorted.columns:
-                trades_sorted['Time'] = trades_sorted['Time'].dt.strftime('%Y-%m-%d %H:%M')
-            st.dataframe(trades_sorted, width='stretch', hide_index=True)
         else:
             trades_month = trades[(trades['Time'].dt.month == month_idx) & (trades['Time'].dt.year == selected_year)]
             trades_sorted = trades_month.sort_values('Time', ascending=False).copy()
             st.markdown(f'<div style="font-size:1.05em;color:#2563eb;font-weight:500;margin-bottom:4px;">No trades for selected day. Showing all trades for <b>{selected_month} {selected_year}</b></div>', unsafe_allow_html=True)
-            if 'Time' in trades_sorted.columns:
-                trades_sorted['Time'] = trades_sorted['Time'].dt.strftime('%Y-%m-%d %H:%M')
-            st.dataframe(trades_sorted, width='stretch', hide_index=True)
+        if 'Time' in trades_sorted.columns:
+            trades_sorted['Time'] = trades_sorted['Time'].dt.strftime('%Y-%m-%d %H:%M')
