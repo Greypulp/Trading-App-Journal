@@ -279,8 +279,14 @@ class Engine:
 # ========== RUN ==========
 
 def main():
+    # Write 'running' to bot_status.txt on start
+    status_path = os.path.join(os.path.dirname(__file__), 'bot_status.txt')
+    try:
+        with open(status_path, 'w') as f:
+            f.write('running\n')
+    except Exception:
+        pass
     init_mt5(); eng = Engine()
-    # Trailing stop monitor removed
 
     def is_market_open():
         # XAUUSD: open Sun 22:00 UTC, close Fri 21:00 UTC (typical for gold/forex)
@@ -314,6 +320,12 @@ def main():
     except KeyboardInterrupt:
         print('Stopping...')
     finally:
+        # Write 'stopped' to bot_status.txt on exit
+        try:
+            with open(status_path, 'w') as f:
+                f.write('stopped\n')
+        except Exception:
+            pass
         mt5.shutdown()
 
 if __name__ == "__main__":

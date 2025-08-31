@@ -11,9 +11,30 @@ st.set_page_config(page_title="MT5 Dashboard", layout="wide")
 # --- Timeframe Map (must be above sidebar controls) ---
 TIMEFRAME_MAP = {'M15': mt5.TIMEFRAME_M15, 'H1': mt5.TIMEFRAME_H1}
 
-# --- Sidebar Controls ---
+
 with st.sidebar:
     st.title("Controls & Risk Settings")
+    # --- MT5 Connection Status ---
+    mt5_status = mt5.initialize() if not mt5.initialize() else True
+    if mt5_status:
+        st.success("🟢 MT5 Connected", icon="✅")
+    else:
+        st.error("🔴 MT5 Not Connected", icon="❌")
+    # --- Bot Connection Status ---
+    bot_status_path = os.path.join(os.path.dirname(__file__), 'bot_status.txt')
+    bot_status = 'unknown'
+    if os.path.exists(bot_status_path):
+        try:
+            with open(bot_status_path, 'r') as f:
+                bot_status = f.read().strip().lower()
+        except Exception:
+            bot_status = 'unknown'
+    if bot_status == 'running':
+        st.success("🤖 Bot Running", icon="✅")
+    elif bot_status == 'stopped':
+        st.error("🤖 Bot Stopped", icon="❌")
+    else:
+        st.warning("🤖 Bot Status Unknown", icon="⚠️")
     selected_tab = st.radio("Select View", ["Dashboard", "Trading Journal", "Backtesting"], key="main_tab")
     if selected_tab == "Backtesting":
         pass
