@@ -8,11 +8,98 @@ import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 import threading
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 import warnings
 import os, json
 
+import requests
+import xml.etree.ElementTree as ET
+
+from datetime import timedelta
+
 # ========== CONFIG ==========
+
+# ========== NEWS BLOCKING ==========
+NEWS_WINDOW_MINUTES = 5  # Block trading 5 min before/after news
+NEWS_EVENTS_PATH = os.path.join(os.path.dirname(__file__), 'news_events.json')  # Placeholder for news events
+
+def load_news_events():
+    """
+    Load news events from a local JSON file. Each event should be a dict with 'time' (ISO8601 string, UTC) and 'impact' (e.g., 'high', 'medium', 'low').
+    Example: [{"time": "2025-09-01T13:30:00Z", "impact": "high", "symbol": "XAUUSD"}]
+    """
+    try:
+        with open(NEWS_EVENTS_PATH, 'r') as f:
+            events = json.load(f)
+        # Convert to datetime
+        for e in events:
+            e['dt'] = datetime.fromisoformat(e['time'].replace('Z', '+00:00'))
+        return events
+    except Exception as e:
+        print(f"Could not load news events: {e}")
+        return []
+
+def fetch_and_update_news_events():
+    """
+    Fetch news events from Forex Factory XML feed and update news_events.json.
+    Only high/medium impact news for XAUUSD (USD, XAU, and global events).
+    """
+    url = 'https://nfs.faireconomy.media/ff_calendar_thisweek.xml'
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        events = []
+        for item in root.findall('event'):
+            impact = item.find('impact').text.lower() if item.find('impact') is not None else ''
+            if impact not in ('high', 'medium'):
+                continue
+            currency = item.find('currency').text if item.find('currency') is not None else ''
+            # Only USD, XAU, or global news for XAUUSD
+            if currency not in ('USD', 'XAU', 'ALL'):
+                continue
+            date_str = item.find('date').text if item.find('date') is not None else ''
+            time_str = item.find('time').text if item.find('time') is not None else ''
+            # Parse date/time to UTC
+            # Forex Factory times are in New York time; need to convert to UTC
+            from datetime import datetime as dt, timedelta
+            import pytz
+            ny_tz = pytz.timezone('America/New_York')
+            try:
+                # Example: date_str = 'Sep 1', time_str = '10:00am'
+                year = datetime.now().year
+                dt_naive = dt.strptime(f"{date_str} {year} {time_str}", "%b %d %Y %I:%M%p")
+                dt_ny = ny_tz.localize(dt_naive)
+                dt_utc = dt_ny.astimezone(timezone.utc)
+                iso_time = dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                continue
+            events.append({
+                'time': iso_time,
+                'impact': impact,
+                'symbol': 'XAUUSD',
+                'title': item.find('title').text if item.find('title') is not None else ''
+            })
+        # Save to file
+        with open(NEWS_EVENTS_PATH, 'w') as f:
+            json.dump(events, f, indent=2)
+        print(f"Fetched and updated {len(events)} news events.")
+    except Exception as e:
+        print(f"Failed to fetch news events: {e}")
+
+def is_news_time(symbol):
+    """
+    Returns True if now is within NEWS_WINDOW_MINUTES before/after a news event for the symbol.
+    """
+    now = datetime.now(timezone.utc)
+    events = load_news_events()
+    for e in events:
+        if e.get('symbol') and e['symbol'] != symbol:
+            continue
+        dt = e['dt']
+        if abs((now - dt).total_seconds()) <= NEWS_WINDOW_MINUTES * 60:
+            return True
+    return False
 
 SYMBOLS = ["XAUUSD"]
 TIMEFRAME = mt5.TIMEFRAME_M15
@@ -39,14 +126,14 @@ def get_max_total_exposure_lots():
 
 MAX_TOTAL_EXPOSURE_LOTS = get_max_total_exposure_lots()  # do not open new trades if total lots >= this
 DEFAULT_SL_PIPS = 50
-DEFAULT_TP_MULT = 2.0
+DEFAULT_TP_MULT = 4.0
 MAGIC = 123456
 DEVIATION = 20
 
 
 # --- Standard risk settings ---
-STANDARD_RISK_PER_TRADE_PCT = 0.5  # 0.5% per trade
-MAX_RISK_PER_SYMBOL_PCT = 1.0      # 1% max risk per symbol per day
+STANDARD_RISK_PER_TRADE_PCT = 0.01  # 0.01% per trade
+MAX_RISK_PER_SYMBOL_PCT = 0.02     # 0.02% max risk per symbol per day
 
 def get_max_risk_per_trade_pct():
     return STANDARD_RISK_PER_TRADE_PCT
@@ -55,7 +142,30 @@ def get_max_risk_per_trade_pct():
 # Telegram settings
 TELEGRAM_BOT_TOKEN = '8177282153:AAHf7HJlNwUG23JMJa9dvnEstihel68VjPU'
 TELEGRAM_CHAT_ID = '8426349009'
+from telegram.ext import Updater, CallbackQueryHandler
 telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
+dispatcher = updater.dispatcher
+
+# Store pending trade for approval
+pending_trade = {}
+
+def approval_callback(update, context):
+    global pending_trade
+    query = update.callback_query
+    query.answer()
+    if query.data == 'approve' and pending_trade:
+        # Execute trade
+        trade = pending_trade
+        send_order(**trade)
+        query.edit_message_text(text="Trade Approved and Executed.")
+        pending_trade = {}
+    elif query.data == 'decline' and pending_trade:
+        query.edit_message_text(text="Trade Declined.")
+        pending_trade = {}
+
+dispatcher.add_handler(CallbackQueryHandler(approval_callback))
+updater.start_polling()
 
 # Suppress specific warnings globally
 warnings.filterwarnings("ignore", message="python-telegram-bot is using upstream urllib3.")
@@ -198,6 +308,10 @@ class Engine:
 
     def scan_and_maybe_trade(self):
         for symbol in SYMBOLS:
+            # Block trading during news window
+            if is_news_time(symbol):
+                print(f"Trading blocked for {symbol}: within {NEWS_WINDOW_MINUTES} min of news event.")
+                continue
             df = fetch_rates(symbol, BARS_HISTORY)
             if df.empty:
                 continue
@@ -219,6 +333,12 @@ class Engine:
                     lvl.active = False
 
     def attempt_trade_on_fill(self, symbol, lvl):
+        global pending_trade
+        # Only allow one open position at a time
+        open_positions = mt5.positions_get(symbol=symbol)
+        if open_positions and len(open_positions) > 0:
+            print(f"Trade blocked: already have an open position for {symbol}.")
+            return
         balance = account_balance()
         if balance is None:
             print('No account info; skipping trade'); return
@@ -246,7 +366,8 @@ class Engine:
 
         # --- Calculate total risk for this symbol today ---
         # For simplicity, assume only one trade per fill, but sum up open positions risk
-        open_positions = mt5.positions_get(symbol=symbol)
+
+        # (Retain risk calculation for other checks, but not for position count)
         open_risk_pct = 0.0
         if open_positions:
             for pos in open_positions:
@@ -286,14 +407,37 @@ class Engine:
             sl = entry + stop_pips * pip
 
         # --- Telegram approval removed: auto-approve all trades ---
-        print(f'Auto-approving trade for {symbol} {side} {lots} lots at {entry}')
-        send_order(symbol, side, lots, entry, sl, tp, comment="swing_fill_riskctrl")
+        # --- Telegram manual approval with inline buttons ---
+        trade_details = f"Trade Setup:\nSymbol: {symbol}\nSide: {side}\nLots: {lots}\nEntry: {entry}\nSL: {sl}\nTP: {tp}"
+        keyboard = [
+            [InlineKeyboardButton("Approve", callback_data='approve'), InlineKeyboardButton("Decline", callback_data='decline')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        try:
+            telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=trade_details, reply_markup=reply_markup)
+            pending_trade = {
+                'symbol': symbol,
+                'side': side,
+                'volume': lots,
+                'price': entry,
+                'sl': sl,
+                'tp': tp,
+                'comment': "swing_fill_riskctrl"
+            }
+            print(f"Trade setup sent for approval via Telegram.")
+        except Exception as e:
+            print(f"Telegram approval send failed: {e}")
 
 # --- Monitor open trades and move SL to BE when price moves in favor by SL distance ---
 
 # ========== RUN ==========
 
 def main():
+    # Fetch and update news events at startup
+    try:
+        fetch_and_update_news_events()
+    except Exception as e:
+        print(f"News fetch failed: {e}")
     # Write 'running' to bot_status.txt on start
     status_path = os.path.join(os.path.dirname(__file__), 'bot_status.txt')
     try:

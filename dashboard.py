@@ -317,42 +317,36 @@ if selected_tab == "Dashboard":
         st.session_state['last_refresh'] = time.time()
     if time.time() - st.session_state['last_refresh'] > 60:
         st.session_state['last_refresh'] = time.time()
-        st.experimental_rerun()
-    # --- Always show countdown timer to next market open ---
-    def get_next_market_open():
+        st.rerun()
+
+    # --- Countdown timer to next session open ---
+    def get_next_session_open():
         now = datetime.now(timezone.utc)
-        weekday = now.weekday()  # Monday=0, Sunday=6
         hour = now.hour
         minute = now.minute
-        # Market closed from Fri 21:00 UTC to Sun 22:00 UTC
-        if (weekday == 4 and (hour > 21 or (hour == 21 and minute >= 0))) or (weekday == 5) or (weekday == 6 and (hour < 22)):
-            # Next open is Sunday 22:00 UTC
-            days_ahead = (6 - weekday) % 7
-            next_open = now.replace(hour=22, minute=0, second=0, microsecond=0) + pd.Timedelta(days=days_ahead)
-            if now > next_open:
-                next_open += pd.Timedelta(days=7)
-            return next_open
+        # Sessions: Asia 00:00-07:59, London 08:00-15:59, NY 16:00-20:59, Closed 21:00-23:59
+        if 0 <= hour < 8:
+            # Next: London 08:00 UTC
+            next_open = now.replace(hour=8, minute=0, second=0, microsecond=0)
+        elif 8 <= hour < 16:
+            # Next: New York 16:00 UTC
+            next_open = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        elif 16 <= hour < 21:
+            # Next: Closed 21:00 UTC
+            next_open = now.replace(hour=21, minute=0, second=0, microsecond=0)
         else:
-            # Market is open, next open is after next close
-            # Find next Friday 21:00 UTC
-            days_ahead = (4 - weekday) % 7
-            next_close = now.replace(hour=21, minute=0, second=0, microsecond=0) + pd.Timedelta(days=days_ahead)
-            if now >= next_close:
-                # Already past this week's close, so next week's open
-                next_open = next_close + pd.Timedelta(days=2, hours=1)
-                return next_open
-            else:
-                # Market is open, so next open is after next close
-                next_open = next_close + pd.Timedelta(days=2, hours=1)
-                return next_open
+            # Next: Asia 00:00 UTC (next day)
+            next_open = (now + pd.Timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        if next_open <= now:
+            next_open += pd.Timedelta(days=1)
+        return next_open
 
-    next_open = get_next_market_open()
-    if next_open:
-        delta = next_open - datetime.now(timezone.utc)
+    next_session_open = get_next_session_open()
+    if next_session_open:
+        delta = next_session_open - datetime.now(timezone.utc)
         hours, remainder = divmod(int(delta.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
-        st.info(f"⏳ Time to Next Market Open: {hours}h {minutes}m {seconds}s (at {next_open.strftime('%Y-%m-%d %H:%M UTC')})")
-    # ...countdown timer to next market open removed...
+        st.info(f"⏳ Time to Next Session Open: {hours}h {minutes}m {seconds}s (at {next_session_open.strftime('%Y-%m-%d %H:%M UTC')})")
 
     # --- Bell notification when market opens (only once per open event) ---
     market_status = get_market_status()

@@ -1,3 +1,6 @@
+# For automatic news fetching and timezone conversion
+requests
+pytz
 MetaTrader5
 pandas
 numpy
