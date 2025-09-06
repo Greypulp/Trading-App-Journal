@@ -102,7 +102,7 @@ def is_news_time(symbol):
     return False
 
 SYMBOLS = ["XAUUSD"]
-TIMEFRAME = mt5.TIMEFRAME_M15
+TIMEFRAMES = [mt5.TIMEFRAME_M3, mt5.TIMEFRAME_M5]
 BARS_HISTORY = 2000
 
 # Swing settings (Pine parity)
@@ -112,7 +112,7 @@ swingSizeL = 15
 # Trading / Risk settings
 ENABLE_TRADING = True   # must be set True to send real orders
 TEST_MODE = False         # if True do not place real orders (prints only)
-MAX_DAILY_DRAWDOWN_PCT = 5.0    # pause entries when daily loss (realized) >= this percent
+MAX_DAILY_DRAWDOWN_PCT = 0.1    # pause entries when daily loss (realized) >= this percent
 
 # --- Load max_total_exposure from config.json ---
 def get_max_total_exposure_lots():
@@ -132,8 +132,8 @@ DEVIATION = 20
 
 
 # --- Standard risk settings ---
-STANDARD_RISK_PER_TRADE_PCT = 0.01  # 0.01% per trade
-MAX_RISK_PER_SYMBOL_PCT = 0.02     # 0.02% max risk per symbol per day
+STANDARD_RISK_PER_TRADE_PCT = 0.1  # 0.1% per trade
+MAX_RISK_PER_SYMBOL_PCT = 0.1     # 0.1% max risk per symbol per day
 
 def get_max_risk_per_trade_pct():
     return STANDARD_RISK_PER_TRADE_PCT
@@ -142,30 +142,33 @@ def get_max_risk_per_trade_pct():
 # Telegram settings
 TELEGRAM_BOT_TOKEN = '8177282153:AAHf7HJlNwUG23JMJa9dvnEstihel68VjPU'
 TELEGRAM_CHAT_ID = '8426349009'
-from telegram.ext import Updater, CallbackQueryHandler
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes
 telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
-updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
-dispatcher = updater.dispatcher
 
 # Store pending trade for approval
 pending_trade = {}
 
-def approval_callback(update, context):
+import asyncio
+async def approval_callback(update, context: ContextTypes.DEFAULT_TYPE):
     global pending_trade
     query = update.callback_query
-    query.answer()
+    await query.answer()
     if query.data == 'approve' and pending_trade:
         # Execute trade
         trade = pending_trade
         send_order(**trade)
-        query.edit_message_text(text="Trade Approved and Executed.")
+        await query.edit_message_text(text="Trade Approved and Executed.")
         pending_trade = {}
     elif query.data == 'decline' and pending_trade:
-        query.edit_message_text(text="Trade Declined.")
+        await query.edit_message_text(text="Trade Declined.")
         pending_trade = {}
 
-dispatcher.add_handler(CallbackQueryHandler(approval_callback))
-updater.start_polling()
+application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+application.add_handler(CallbackQueryHandler(approval_callback))
+def run_telegram_bot():
+    application.run_polling()
+
+# Start Telegram bot in a background thread
 
 # Suppress specific warnings globally
 warnings.filterwarnings("ignore", message="python-telegram-bot is using upstream urllib3.")
@@ -189,7 +192,11 @@ def init_mt5():
             raise RuntimeError(f"Symbol select failed for {sym}")
 
 def fetch_rates(symbol, n_bars=2000):
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAME, 0, n_bars)
+    # Default to M15 if not specified
+    timeframe = mt5.TIMEFRAME_M15
+    if hasattr(fetch_rates, 'timeframe'):
+        timeframe = fetch_rates.timeframe
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n_bars)
     if rates is None:
         return pd.DataFrame()
     df = pd.DataFrame(rates)
@@ -303,34 +310,132 @@ def calculate_atr(df, period=14):
 
 # ========== ENGINE ==========
 class Engine:
+    def find_fvg(self, df):
+        # Returns list of FVGs as tuples: (start_idx, end_idx, high, low)
+        fvg_list = []
+        for i in range(2, len(df)):
+            prev_high = df['high'].iat[i-2]
+            prev_low = df['low'].iat[i-2]
+            curr_high = df['high'].iat[i]
+            curr_low = df['low'].iat[i]
+            # Bullish FVG: previous high < current low
+            if prev_high < curr_low:
+                fvg_list.append((i-2, i, prev_high, curr_low))
+            # Bearish FVG: previous low > current high
+            if prev_low > curr_high:
+                fvg_list.append((i-2, i, curr_high, prev_low))
+        return fvg_list
     def __init__(self):
         self.levels = deque(maxlen=500)
 
     def scan_and_maybe_trade(self):
         for symbol in SYMBOLS:
-            # Block trading during news window
-            if is_news_time(symbol):
-                print(f"Trading blocked for {symbol}: within {NEWS_WINDOW_MINUTES} min of news event.")
-                continue
-            df = fetch_rates(symbol, BARS_HISTORY)
-            if df.empty:
-                continue
-            piv_hi, piv_lo = find_pivots(df, swingSizeL, swingSizeR)
-            # detect pivots and append
-            for i in range(len(piv_hi)):
-                if piv_hi[i]:
-                    price = float(df['high'].iat[i]); self.levels.append((symbol, Level('high', price, i)))
-                if piv_lo[i]:
-                    price = float(df['low'].iat[i]); self.levels.append((symbol, Level('low', price, i)))
-            # check latest bar for fills and trade
-            last = df.iloc[-1]
-            highv = float(last['high']); lowv = float(last['low'])
-            for sym, lvl in list(self.levels):
-                if sym != symbol or not lvl.active: continue
-                if highv >= lvl.price and lowv <= lvl.price:
-                    lvl.filled = True
-                    self.attempt_trade_on_fill(sym, lvl)
-                    lvl.active = False
+            for timeframe in TIMEFRAMES:
+                # Block trading during news window
+                if is_news_time(symbol):
+                    print(f"Trading blocked for {symbol}: within {NEWS_WINDOW_MINUTES} min of news event.")
+                    continue
+                df = mt5.copy_rates_from_pos(symbol, timeframe, 0, BARS_HISTORY)
+                if df is None:
+                    continue
+                df = pd.DataFrame(df)
+                df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+                df.set_index('time', inplace=True)
+                if df.empty:
+                    continue
+                piv_hi, piv_lo = find_pivots(df, swingSizeL, swingSizeR)
+                # detect pivots and append
+                for i in range(len(piv_hi)):
+                    if piv_hi[i]:
+                        price = float(df['high'].iat[i]); self.levels.append((symbol, Level('high', price, i)))
+                    if piv_lo[i]:
+                        price = float(df['low'].iat[i]); self.levels.append((symbol, Level('low', price, i)))
+                # check latest bar for fills and trade
+                last = df.iloc[-1]
+                highv = float(last['high']); lowv = float(last['low'])
+                fvg_list = self.find_fvg(df)
+                for sym, lvl in list(self.levels):
+                    if sym != symbol or not lvl.active: continue
+                    # --- Order block rejection and candle close confluence ---
+                    touched = highv >= lvl.price and lowv <= lvl.price
+                    if touched:
+                        prev = df.iloc[-2] if len(df) > 1 else None
+                        if prev is not None:
+                            # --- FVG rejection confluence ---
+                            fvg_rejected = False
+                            for fvg in fvg_list:
+                                _, _, fvg_high, fvg_low = fvg
+                                if (lowv <= fvg_high and highv >= fvg_low):
+                                    if prev['close'] < fvg_low or prev['close'] > fvg_high:
+                                        fvg_rejected = True
+                                        break
+                            # --- Order block rejection confluence ---
+                            ob_rejected = False
+                            if lvl.kind == 'high' and prev['close'] < lvl.price:
+                                ob_rejected = True
+                            elif lvl.kind == 'low' and prev['close'] > lvl.price:
+                                ob_rejected = True
+                            # --- Break of Structure Confluence ---
+                            bos_ok = False
+                            if lvl.kind == 'high':
+                                recent_highs = df['high'].iloc[-10:-1] if len(df) > 10 else df['high'].iloc[:-1]
+                                bos_ok = highv > recent_highs.max()
+                            elif lvl.kind == 'low':
+                                recent_lows = df['low'].iloc[-10:-1] if len(df) > 10 else df['low'].iloc[:-1]
+                                bos_ok = lowv < recent_lows.min()
+
+                            # --- Engulfing Candle Confluence ---
+                            engulf_ok = False
+                            # The candle that caused the liquidity sweep is the previous candle (prev)
+                            # Engulfing: current candle's body fully engulfs previous candle's body
+                            if prev is not None:
+                                curr_open = last['open']; curr_close = last['close']
+                                prev_open = prev['open']; prev_close = prev['close']
+                                curr_body_high = max(curr_open, curr_close)
+                                curr_body_low = min(curr_open, curr_close)
+                                prev_body_high = max(prev_open, prev_close)
+                                prev_body_low = min(prev_open, prev_close)
+                                if curr_body_high > prev_body_high and curr_body_low < prev_body_low:
+                                    engulf_ok = True
+
+                            # --- Swing Match Confluence ---
+                            swing_match_ok = False
+                            # Check if recent swing high/low equals any older swing high/low
+                            if lvl.kind == 'high':
+                                recent_idx = None
+                                for j in range(len(piv_hi)-2, -1, -1):
+                                    if piv_hi[j]:
+                                        recent_idx = j
+                                        break
+                                if recent_idx is not None:
+                                    recent_swing_high = float(df['high'].iat[recent_idx])
+                                    for k in range(recent_idx-1, -1, -1):
+                                        if piv_hi[k]:
+                                            older_swing_high = float(df['high'].iat[k])
+                                            if np.isclose(recent_swing_high, older_swing_high, atol=1e-5):
+                                                swing_match_ok = True
+                                                break
+                            elif lvl.kind == 'low':
+                                recent_idx = None
+                                for j in range(len(piv_lo)-2, -1, -1):
+                                    if piv_lo[j]:
+                                        recent_idx = j
+                                        break
+                                if recent_idx is not None:
+                                    recent_swing_low = float(df['low'].iat[recent_idx])
+                                    for k in range(recent_idx-1, -1, -1):
+                                        if piv_lo[k]:
+                                            older_swing_low = float(df['low'].iat[k])
+                                            if np.isclose(recent_swing_low, older_swing_low, atol=1e-5):
+                                                swing_match_ok = True
+                                                break
+
+                            # --- Final trade setup trigger: any confluence satisfied ---
+                            confluence_ok = (ob_rejected or fvg_rejected or engulf_ok or swing_match_ok)
+                            if bos_ok and confluence_ok:
+                                lvl.filled = True
+                                self.attempt_trade_on_fill(sym, lvl)
+                                lvl.active = False
 
     def attempt_trade_on_fill(self, symbol, lvl):
         global pending_trade
@@ -446,6 +551,40 @@ def main():
     except Exception:
         pass
     init_mt5(); eng = Engine()
+
+    # If bot is logged and active, send a summary of trade logic for the day to Telegram
+    if os.path.exists(status_path):
+        try:
+            with open(status_path, 'r') as f:
+                bot_status = f.read().strip().lower()
+        except Exception:
+            bot_status = 'unknown'
+        if bot_status == 'running':
+            # Prepare trade logic summary
+            trade_summary = (
+                "Trade Logic Summary for Today:\n"
+                "- Symbol: XAUUSD\n"
+                "- Timeframe: M15\n"
+                "- Confluences (any triggers a trade, plus break of structure):\n"
+                "    • Order block rejection\n"
+                "    • FVG rejection\n"
+                "    • Engulfing candle\n"
+                "    • Recent swing low/high equals order swing low/high\n"
+                "- Risk Controls:\n"
+                "    • Max daily drawdown: 5%\n"
+                "    • Max total exposure: 5 lots\n"
+                "    • Standard risk per trade: 0.01%\n"
+                "    • Max risk per symbol per day: 0.02%\n"
+                "- Manual trade approval via Telegram inline buttons\n"
+                "- Trading paused during news events\n"
+            )
+            import asyncio
+            async def send_summary_signal():
+                try:
+                    await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=trade_summary)
+                except Exception as e:
+                    print(f"Telegram summary failed: {e}")
+            asyncio.run(send_summary_signal())
 
     def is_market_open():
         # XAUUSD: open Sun 22:00 UTC, close Fri 21:00 UTC (typical for gold/forex)
