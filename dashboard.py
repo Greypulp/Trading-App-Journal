@@ -65,7 +65,10 @@ def get_market_status():
     return 'Open'
  # dashboard.py (Streamlit) - includes risk management metrics and live limits
 import os, time, json
-from datetime import datetime, timezone
+import sys
+
+## License key requirement removed
+from datetime import datetime, timezone, date, timedelta
 import streamlit as st
 import MetaTrader5 as mt5
 import pandas as pd
@@ -716,3 +719,43 @@ elif selected_tab == "Trading Journal":
             if 'Time' in trades_sorted.columns:
                 trades_sorted['Time'] = trades_sorted['Time'].dt.strftime('%Y-%m-%d %H:%M')
             st.dataframe(trades_sorted, width='stretch', hide_index=True)
+    # --- Date range selector for chart ---
+    min_date = df.index.min().date() if not df.empty else date.today() - timedelta(days=30)
+    max_date = df.index.max().date() if not df.empty else date.today()
+    date_range = st.date_input(
+        "Select date or range to view on chart",
+        value=(max_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+        key="chart_date_range"
+    )
+    # Filter df to selected date(s)
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date, end_date = date_range
+        mask = (df.index.date >= start_date) & (df.index.date <= end_date)
+        df_chart = df[mask]
+    else:
+        mask = (df.index.date == date_range)
+        df_chart = df[mask]
+    # If no data for selected range, show warning
+    if df_chart.empty:
+        st.warning(f"No data for selected date(s): {date_range}")
+    else:
+        piv_hi_chart, piv_lo_chart = find_pivots(df_chart, L, R)
+        fig = go.Figure(data=[go.Candlestick(x=df_chart.index, open=df_chart['open'], high=df_chart['high'], low=df_chart['low'], close=df_chart['close'])])
+        hi_idx = np.where(piv_hi_chart.values)[0]
+        lo_idx = np.where(piv_lo_chart.values)[0]
+        if len(hi_idx):
+            fig.add_trace(go.Scatter(x=df_chart.index[hi_idx], y=df_chart['high'].iloc[hi_idx], mode='markers', marker=dict(color='red', size=8), name='Pivot Highs'))
+        if len(lo_idx):
+            fig.add_trace(go.Scatter(x=df_chart.index[lo_idx], y=df_chart['low'].iloc[lo_idx], mode='markers', marker=dict(color='green', size=8), name='Pivot Lows'))
+        fig.update_layout(
+            xaxis_rangeslider_visible=True,
+            xaxis_title='Time',
+            yaxis_title='Price',
+            margin=dict(l=10, r=10, t=30, b=10),
+            plot_bgcolor='#f8fafc',
+            paper_bgcolor='#f8fafc',
+            font=dict(size=13)
+        )
+        st.plotly_chart(fig, width='stretch')

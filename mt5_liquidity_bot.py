@@ -1,6 +1,8 @@
 # mt5_liquidity_bot.py
 # MT5 Liquidity Sweep Bot with Trading and Risk Management (pause new entries)
 import time
+
+## License key requirement removed
 from dataclasses import dataclass
 from collections import deque
 from datetime import datetime, timezone
@@ -139,6 +141,7 @@ def get_max_risk_per_trade_pct():
     return STANDARD_RISK_PER_TRADE_PCT
 
 
+
 # Telegram settings
 TELEGRAM_BOT_TOKEN = '8177282153:AAHf7HJlNwUG23JMJa9dvnEstihel68VjPU'
 TELEGRAM_CHAT_ID = '8426349009'
@@ -174,6 +177,26 @@ def run_telegram_bot():
 warnings.filterwarnings("ignore", message="python-telegram-bot is using upstream urllib3.")
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API.")
 
+# Send Telegram message on bot startup
+def send_startup_telegram():
+    import datetime
+    msg = f"MT5 Liquidity Bot activated on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    try:
+        # Use the running Application's event loop for sending messages
+        from telegram.ext import Application
+        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        async def send():
+            try:
+                await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            except Exception as e:
+                print(f"Startup Telegram notification failed: {e}")
+        import asyncio
+        asyncio.run(send())
+    except Exception as e:
+        print(f"Startup Telegram notification failed (refactored): {e}")
+
+send_startup_telegram()
+
 # ========== DATA STRUCTURES ==========
 @dataclass
 class Level:
@@ -187,6 +210,11 @@ class Level:
 def init_mt5():
     if not mt5.initialize():
         raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+    account = mt5.account_info()
+    if account:
+        print(f"[MT5] Connected to live account: {account.login}, Balance: {account.balance}")
+    else:
+        print("[MT5] Connected, but no account info available.")
     for sym in SYMBOLS:
         if not mt5.symbol_select(sym, True):
             raise RuntimeError(f"Symbol select failed for {sym}")
@@ -270,15 +298,35 @@ def send_order(symbol, side, volume, price, sl, tp, comment=''):
 
     # Send Telegram notification (async)
     import asyncio
-    async def send_telegram():
+    def safe_telegram_send():
+        import asyncio
+        async def send():
+            try:
+                strategy_info = comment if comment else 'Unknown strategy'
+                msg = (
+                    f"Trade Activated\n"
+                    f"Symbol: {symbol}\n"
+                    f"Side: {side}\n"
+                    f"Volume: {volume}\n"
+                    f"Price: {price}\n"
+                    f"SL: {sl}  TP: {tp}\n"
+                    f"Strategy: {strategy_info}"
+                )
+                await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            except Exception as e:
+                print(f"Telegram notification failed: {e}")
         try:
-            await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text='Trade Activated')
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import threading
+                threading.Thread(target=lambda: asyncio.run(send())).start()
+            else:
+                loop.run_until_complete(send())
+        except RuntimeError:
+            asyncio.run(send())
         except Exception as e:
-            print(f"Telegram notification failed: {e}")
-    try:
-        asyncio.run(send_telegram())
-    except Exception as e:
-        print(f"Telegram notification failed (asyncio): {e}")
+            print(f"Telegram notification failed (asyncio): {e}")
+    safe_telegram_send()
     return res
 
  # Telegram bot and approval logic removed
@@ -439,11 +487,22 @@ class Engine:
 
     def attempt_trade_on_fill(self, symbol, lvl):
         global pending_trade
-        # Only allow one open position at a time
+        # Allow up to 2 open positions per symbol, but block if any is in drawdown
         open_positions = mt5.positions_get(symbol=symbol)
-        if open_positions and len(open_positions) > 0:
-            print(f"Trade blocked: already have an open position for {symbol}.")
+        if open_positions and len(open_positions) >= 2:
+            print(f"Trade blocked: already have 2 open positions for {symbol}.")
             return
+        # Block new trade if any open position is in drawdown
+        if open_positions:
+            for pos in open_positions:
+                # Drawdown: current price less favorable than entry (for buys, price < entry; for sells, price > entry)
+                tick = mt5.symbol_info_tick(symbol)
+                if pos.type == mt5.ORDER_TYPE_BUY and tick.bid < pos.price_open:
+                    print(f"Trade blocked: open BUY position in drawdown for {symbol}.")
+                    return
+                elif pos.type == mt5.ORDER_TYPE_SELL and tick.ask > pos.price_open:
+                    print(f"Trade blocked: open SELL position in drawdown for {symbol}.")
+                    return
         balance = account_balance()
         if balance is None:
             print('No account info; skipping trade'); return
@@ -560,21 +619,21 @@ def main():
         except Exception:
             bot_status = 'unknown'
         if bot_status == 'running':
-            # Prepare trade logic summary
+            # Prepare updated trade logic summary
             trade_summary = (
                 "Trade Logic Summary for Today:\n"
                 "- Symbol: XAUUSD\n"
-                "- Timeframe: M15\n"
+                "- Timeframes: 3m, 5m\n"
                 "- Confluences (any triggers a trade, plus break of structure):\n"
                 "    • Order block rejection\n"
                 "    • FVG rejection\n"
                 "    • Engulfing candle\n"
-                "    • Recent swing low/high equals order swing low/high\n"
+                "    • Recent swing high/low equals older swing high/low\n"
                 "- Risk Controls:\n"
-                "    • Max daily drawdown: 5%\n"
+                "    • Max daily drawdown: 0.1%\n"
                 "    • Max total exposure: 5 lots\n"
-                "    • Standard risk per trade: 0.01%\n"
-                "    • Max risk per symbol per day: 0.02%\n"
+                "    • Standard risk per trade: 0.1%\n"
+                "    • Max risk per symbol per day: 0.1%\n"
                 "- Manual trade approval via Telegram inline buttons\n"
                 "- Trading paused during news events\n"
             )
