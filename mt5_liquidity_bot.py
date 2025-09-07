@@ -114,7 +114,7 @@ swingSizeL = 15
 # Trading / Risk settings
 ENABLE_TRADING = True   # must be set True to send real orders
 TEST_MODE = False         # if True do not place real orders (prints only)
-MAX_DAILY_DRAWDOWN_PCT = 0.1    # pause entries when daily loss (realized) >= this percent
+MAX_DAILY_DRAWDOWN_PCT = 1.0    # pause entries when daily loss (realized) >= this percent
 
 # --- Load max_total_exposure from config.json ---
 def get_max_total_exposure_lots():
@@ -134,7 +134,7 @@ DEVIATION = 20
 
 
 # --- Standard risk settings ---
-STANDARD_RISK_PER_TRADE_PCT = 0.1  # 0.1% per trade
+STANDARD_RISK_PER_TRADE_PCT = 1.0  # 1% per trade
 MAX_RISK_PER_SYMBOL_PCT = 0.1     # 0.1% max risk per symbol per day
 
 def get_max_risk_per_trade_pct():
@@ -384,135 +384,104 @@ class Engine:
                     print(f"Trading blocked for {symbol}: within {NEWS_WINDOW_MINUTES} min of news event.")
                     continue
                 df = mt5.copy_rates_from_pos(symbol, timeframe, 0, BARS_HISTORY)
-                if df is None:
-                    continue
-                df = pd.DataFrame(df)
-                df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
-                df.set_index('time', inplace=True)
-                if df.empty:
-                    continue
+                # Loop through levels and apply confluence logic
                 piv_hi, piv_lo = find_pivots(df, swingSizeL, swingSizeR)
-                # detect pivots and append
-                for i in range(len(piv_hi)):
-                    if piv_hi[i]:
-                        price = float(df['high'].iat[i]); self.levels.append((symbol, Level('high', price, i)))
-                    if piv_lo[i]:
-                        price = float(df['low'].iat[i]); self.levels.append((symbol, Level('low', price, i)))
-                # check latest bar for fills and trade
-                last = df.iloc[-1]
-                highv = float(last['high']); lowv = float(last['low'])
                 fvg_list = self.find_fvg(df)
-                for sym, lvl in list(self.levels):
-                    if sym != symbol or not lvl.active: continue
-                    # --- Order block rejection and candle close confluence ---
-                    touched = highv >= lvl.price and lowv <= lvl.price
-                    if touched:
-                        prev = df.iloc[-2] if len(df) > 1 else None
-                        if prev is not None:
-                            # --- FVG rejection confluence ---
-                            fvg_rejected = False
-                            for fvg in fvg_list:
-                                _, _, fvg_high, fvg_low = fvg
-                                if (lowv <= fvg_high and highv >= fvg_low):
-                                    if prev['close'] < fvg_low or prev['close'] > fvg_high:
-                                        fvg_rejected = True
+                for lvl in self.levels:
+                    idx = lvl.pivot_index
+                    # Define previous and last candles
+                    prev = df.iloc[idx-1] if idx > 0 else None
+                    last = df.iloc[idx] if idx < len(df) else None
+                    highv = df['high'].iat[idx] if idx < len(df) else None
+                    lowv = df['low'].iat[idx] if idx < len(df) else None
+                    # FVG rejection confluence
+                    fvg_rejected = False
+                    for fvg in fvg_list:
+                        _, _, fvg_high, fvg_low = fvg
+                        if lvl.kind == 'high' and highv < fvg_low:
+                            fvg_rejected = True
+                        elif lvl.kind == 'low' and lowv > fvg_high:
+                            fvg_rejected = True
+                    # --- Order block rejection confluence ---
+                    ob_rejected = False
+                    if prev is not None:
+                        if lvl.kind == 'high' and prev['close'] < lvl.price:
+                            ob_rejected = True
+                        elif lvl.kind == 'low' and prev['close'] > lvl.price:
+                            ob_rejected = True
+                    # --- Break of Structure Confluence ---
+                    bos_ok = False
+                    if lvl.kind == 'high':
+                        recent_highs = df['high'].iloc[-10:-1] if len(df) > 10 else df['high'].iloc[:-1]
+                        bos_ok = highv is not None and highv > recent_highs.max()
+                    elif lvl.kind == 'low':
+                        recent_lows = df['low'].iloc[-10:-1] if len(df) > 10 else df['low'].iloc[:-1]
+                        bos_ok = lowv is not None and lowv < recent_lows.min()
+                    # --- Engulfing Candle Confluence ---
+                    engulf_ok = False
+                    if prev is not None and last is not None:
+                        curr_open = last['open']; curr_close = last['close']
+                        prev_open = prev['open']; prev_close = prev['close']
+                        curr_body_high = max(curr_open, curr_close)
+                        curr_body_low = min(curr_open, curr_close)
+                        prev_body_high = max(prev_open, prev_close)
+                        prev_body_low = min(prev_open, prev_close)
+                        if curr_body_high > prev_body_high and curr_body_low < prev_body_low:
+                            engulf_ok = True
+                    # --- Swing Match Confluence ---
+                    swing_match_ok = False
+                    if lvl.kind == 'high':
+                        recent_idx = None
+                        for j in range(len(piv_hi)-2, -1, -1):
+                            if piv_hi[j]:
+                                recent_idx = j
+                                break
+                        if recent_idx is not None:
+                            recent_swing_high = float(df['high'].iat[recent_idx])
+                            for k in range(recent_idx-1, -1, -1):
+                                if piv_hi[k]:
+                                    older_swing_high = float(df['high'].iat[k])
+                                    if np.isclose(recent_swing_high, older_swing_high, atol=1e-5):
+                                        swing_match_ok = True
                                         break
-                            # --- Order block rejection confluence ---
-                            ob_rejected = False
-                            if lvl.kind == 'high' and prev['close'] < lvl.price:
-                                ob_rejected = True
-                            elif lvl.kind == 'low' and prev['close'] > lvl.price:
-                                ob_rejected = True
-                            # --- Break of Structure Confluence ---
-                            bos_ok = False
-                            if lvl.kind == 'high':
-                                recent_highs = df['high'].iloc[-10:-1] if len(df) > 10 else df['high'].iloc[:-1]
-                                bos_ok = highv > recent_highs.max()
-                            elif lvl.kind == 'low':
-                                recent_lows = df['low'].iloc[-10:-1] if len(df) > 10 else df['low'].iloc[:-1]
-                                bos_ok = lowv < recent_lows.min()
-
-                            # --- Engulfing Candle Confluence ---
-                            engulf_ok = False
-                            # The candle that caused the liquidity sweep is the previous candle (prev)
-                            # Engulfing: current candle's body fully engulfs previous candle's body
-                            if prev is not None:
-                                curr_open = last['open']; curr_close = last['close']
-                                prev_open = prev['open']; prev_close = prev['close']
-                                curr_body_high = max(curr_open, curr_close)
-                                curr_body_low = min(curr_open, curr_close)
-                                prev_body_high = max(prev_open, prev_close)
-                                prev_body_low = min(prev_open, prev_close)
-                                if curr_body_high > prev_body_high and curr_body_low < prev_body_low:
-                                    engulf_ok = True
-
-                            # --- Swing Match Confluence ---
-                            swing_match_ok = False
-                            # Check if recent swing high/low equals any older swing high/low
-                            if lvl.kind == 'high':
-                                recent_idx = None
-                                for j in range(len(piv_hi)-2, -1, -1):
-                                    if piv_hi[j]:
-                                        recent_idx = j
+                    elif lvl.kind == 'low':
+                        recent_idx = None
+                        for j in range(len(piv_lo)-2, -1, -1):
+                            if piv_lo[j]:
+                                recent_idx = j
+                                break
+                        if recent_idx is not None:
+                            recent_swing_low = float(df['low'].iat[recent_idx])
+                            for k in range(recent_idx-1, -1, -1):
+                                if piv_lo[k]:
+                                    older_swing_low = float(df['low'].iat[k])
+                                    if np.isclose(recent_swing_low, older_swing_low, atol=1e-5):
+                                        swing_match_ok = True
                                         break
-                                if recent_idx is not None:
-                                    recent_swing_high = float(df['high'].iat[recent_idx])
-                                    for k in range(recent_idx-1, -1, -1):
-                                        if piv_hi[k]:
-                                            older_swing_high = float(df['high'].iat[k])
-                                            if np.isclose(recent_swing_high, older_swing_high, atol=1e-5):
-                                                swing_match_ok = True
-                                                break
-                            elif lvl.kind == 'low':
-                                recent_idx = None
-                                for j in range(len(piv_lo)-2, -1, -1):
-                                    if piv_lo[j]:
-                                        recent_idx = j
-                                        break
-                                if recent_idx is not None:
-                                    recent_swing_low = float(df['low'].iat[recent_idx])
-                                    for k in range(recent_idx-1, -1, -1):
-                                        if piv_lo[k]:
-                                            older_swing_low = float(df['low'].iat[k])
-                                            if np.isclose(recent_swing_low, older_swing_low, atol=1e-5):
-                                                swing_match_ok = True
-                                                break
-
-                            # --- Final trade setup trigger: any confluence satisfied ---
-                            confluence_ok = (ob_rejected or fvg_rejected or engulf_ok or swing_match_ok)
-                            if bos_ok and confluence_ok:
-                                lvl.filled = True
-                                self.attempt_trade_on_fill(sym, lvl)
-                                lvl.active = False
+                    # --- Final trade setup trigger: any confluence satisfied ---
+                    confluence_ok = (ob_rejected or fvg_rejected or engulf_ok or swing_match_ok)
+                    if bos_ok and confluence_ok:
+                        lvl.filled = True
+                        self.attempt_trade_on_fill(symbol, lvl)
+                        lvl.active = False
 
     def attempt_trade_on_fill(self, symbol, lvl):
         global pending_trade
-        # Allow up to 2 open positions per symbol, but block if any is in drawdown
+        # Remove open position limit and drawdown block; only max daily drawdown is enforced
         open_positions = mt5.positions_get(symbol=symbol)
-        if open_positions and len(open_positions) >= 2:
-            print(f"Trade blocked: already have 2 open positions for {symbol}.")
-            return
-        # Block new trade if any open position is in drawdown
-        if open_positions:
-            for pos in open_positions:
-                # Drawdown: current price less favorable than entry (for buys, price < entry; for sells, price > entry)
-                tick = mt5.symbol_info_tick(symbol)
-                if pos.type == mt5.ORDER_TYPE_BUY and tick.bid < pos.price_open:
-                    print(f"Trade blocked: open BUY position in drawdown for {symbol}.")
-                    return
-                elif pos.type == mt5.ORDER_TYPE_SELL and tick.ask > pos.price_open:
-                    print(f"Trade blocked: open SELL position in drawdown for {symbol}.")
-                    return
         balance = account_balance()
         if balance is None:
-            print('No account info; skipping trade'); return
+            print('No account info; skipping trade')
+            return
         realized = today_realized_pnl()
         realized_pct = (realized / balance) * 100.0 if balance else 0.0
         if realized_pct <= -MAX_DAILY_DRAWDOWN_PCT:
-            print(f'Trade blocked: daily realized loss {realized_pct:.2f}% <= -{MAX_DAILY_DRAWDOWN_PCT}%'); return
+            print(f'Trade blocked: daily realized loss {realized_pct:.2f}% <= -{MAX_DAILY_DRAWDOWN_PCT}%')
+            return
         exposure = current_exposure_lots(symbol)
         if exposure >= MAX_TOTAL_EXPOSURE_LOTS:
-            print(f'Trade blocked: exposure {exposure} lots >= {MAX_TOTAL_EXPOSURE_LOTS}'); return
+            print(f'Trade blocked: exposure {exposure} lots >= {MAX_TOTAL_EXPOSURE_LOTS}')
+            return
         info = mt5.symbol_info(symbol)
         digits = info.digits
         pip = 0.0001 if digits >= 4 else 0.01
@@ -545,11 +514,13 @@ class Engine:
         risk_pct = STANDARD_RISK_PER_TRADE_PCT
         # Cap risk so total for symbol does not exceed MAX_RISK_PER_SYMBOL_PCT
         if open_risk_pct + risk_pct > MAX_RISK_PER_SYMBOL_PCT:
-            print(f'Trade blocked: would exceed max risk {MAX_RISK_PER_SYMBOL_PCT}% for {symbol} (open: {open_risk_pct:.2f}%)'); return
+            print(f'Trade blocked: would exceed max risk {MAX_RISK_PER_SYMBOL_PCT}% for {symbol} (open: {open_risk_pct:.2f}%)')
+            return
 
         lots = lot_size_by_risk(symbol, balance, stop_pips, risk_pct)
         if exposure + lots > MAX_TOTAL_EXPOSURE_LOTS:
-            print('Trade blocked: would exceed total exposure'); return
+            print('Trade blocked: would exceed total exposure')
+            return
 
         # --- Calculate risk in $ ---
         pip_val = info.trade_contract_size * (0.0001 if info.digits >= 4 else 0.01)
@@ -570,27 +541,9 @@ class Engine:
             tp = float(df['low'].iloc[next_pivot_idx]) if next_pivot_idx is not None else entry - stop_pips * pip * DEFAULT_TP_MULT
             sl = entry + stop_pips * pip
 
-        # --- Telegram approval removed: auto-approve all trades ---
-        # --- Telegram manual approval with inline buttons ---
-        trade_details = f"Trade Setup:\nSymbol: {symbol}\nSide: {side}\nLots: {lots}\nEntry: {entry}\nSL: {sl}\nTP: {tp}"
-        keyboard = [
-            [InlineKeyboardButton("Approve", callback_data='approve'), InlineKeyboardButton("Decline", callback_data='decline')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        try:
-            telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=trade_details, reply_markup=reply_markup)
-            pending_trade = {
-                'symbol': symbol,
-                'side': side,
-                'volume': lots,
-                'price': entry,
-                'sl': sl,
-                'tp': tp,
-                'comment': "swing_fill_riskctrl"
-            }
-            print(f"Trade setup sent for approval via Telegram.")
-        except Exception as e:
-            print(f"Telegram approval send failed: {e}")
+        # --- Auto-execute trade immediately when setup is found ---
+        send_order(symbol, side, lots, entry, sl, tp, comment="swing_fill_riskctrl")
+        print(f"Trade executed: {side} {symbol} {lots} lots @ {entry}, SL: {sl}, TP: {tp}")
 
 # --- Monitor open trades and move SL to BE when price moves in favor by SL distance ---
 
